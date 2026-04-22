@@ -1,0 +1,79 @@
+# Step 2: CT/MRI Registration & Surgical Navigation Visualization
+
+## Background
+
+We have from Step 1:
+- `fused_mesh.ply` — inner tissue surface reconstructed from endoscopic video
+- `camera_trajectory.json` — per-frame camera poses
+
+Now we need to:
+1. Get a 3D organ model (simulating a pre-op CT scan)
+2. Register (align) the endoscopic mesh to it
+3. Visualize the camera trajectory on the organ — the "surgical GPS"
+
+## User Review Required
+
+> [!IMPORTANT]
+> The EndoNeRF dataset does **not** come with paired CT/MRI scans. For a working demo, I'll create a **synthetic organ model** (a tubular/ellipsoidal shape resembling the inner tissue cavity). This demonstrates the full registration + visualization pipeline. When you have real paired data, swapping in a real CT mesh is straightforward.
+
+> [!NOTE]
+> If you want to use a real public CT dataset instead (e.g., HQColon — 435 colon segmentations), I can set that up, but it requires downloading ~2-5 GB and installing `nibabel`/`SimpleITK`. Let me know if you'd prefer that route.
+
+## Proposed Changes
+
+### Synthetic Organ Model
+
+#### [NEW] [create_synthetic_organ.py](file:///home/mi3dr/Endo-4DGS/create_synthetic_organ.py)
+
+Generates a synthetic tubular organ mesh that roughly encloses the endoscopic reconstruction:
+- Reads the endoscopic mesh bounding box to determine size/position
+- Creates a larger enclosing ellipsoidal/tubular surface (simulating an organ cavity)
+- Saves as `synthetic_organ.ply`
+
+---
+
+### Registration Script
+
+#### [NEW] [register_to_organ.py](file:///home/mi3dr/Endo-4DGS/register_to_organ.py)
+
+Aligns the endoscopic mesh to the organ model using ICP (Iterative Closest Point):
+1. Load both meshes (endoscopic + organ)
+2. Downsample to point clouds for efficient registration
+3. Compute initial rough alignment (centroid matching)
+4. Run **coarse-to-fine ICP** registration
+5. Apply the resulting transformation to align coordinate systems
+6. Save the transform matrix for later use
+
+---
+
+### Visualization Script (the "GPS")
+
+#### [NEW] [visualize_navigation.py](file:///home/mi3dr/Endo-4DGS/visualize_navigation.py)
+
+Interactive 3D visualization showing:
+- **Semi-transparent organ** model (outer context)
+- **Colored endoscopic mesh** registered inside the organ  
+- **Camera trajectory** as a path with directional arrows
+- **Camera frustums** at key frames showing where the endoscope was looking
+- Exports a static image + HTML for interactive viewing
+
+---
+
+## Verification Plan
+
+### Automated Tests
+```bash
+# 1. Generate synthetic organ
+python create_synthetic_organ.py --model_path output/endonerf/pulling
+
+# 2. Register endoscopic mesh to organ
+python register_to_organ.py --model_path output/endonerf/pulling
+
+# 3. Visualize the GPS
+python visualize_navigation.py --model_path output/endonerf/pulling
+```
+
+### Manual Verification
+- Verify the endoscopic mesh sits **inside** the organ model
+- Camera trajectory should form a plausible path along the inner surface
+- The visualization should clearly show "where the camera is" on the organ

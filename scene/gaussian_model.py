@@ -239,7 +239,7 @@ class GaussianModel:
     def load_model(self, path):
         print("loading model from exists{}".format(path))
         weight_dict = torch.load(os.path.join(path,"deformation.pth"),map_location="cuda")
-        self._deformation.load_state_dict(weight_dict)
+        self._deformation.load_state_dict(weight_dict, strict=False)
         self._deformation = self._deformation.to("cuda")
         self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
         self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device="cuda")
@@ -572,7 +572,7 @@ class GaussianModel:
         rotations = self._rotation.detach()
         opacity = self._opacity.detach()
         time =  torch.tensor(0).to("cuda").repeat(means3D.shape[0],1)
-        means3D_deform, scales_deform, rotations_deform, _ = self._deformation(means3D, scales, rotations, opacity, time)
+        means3D_deform, scales_deform, rotations_deform, _, _ = self._deformation(means3D, scales, rotations, opacity, time)
         position_error = (means3D_deform - means3D)**2
         rotation_error = (rotations_deform - rotations)**2 
         scaling_erorr = (scales_deform - scales)**2
@@ -585,7 +585,10 @@ class GaussianModel:
         
     @torch.no_grad()
     def update_deformation_table(self, means3D, pc):
-        
+        # Compute deformation magnitude as the mask
+        time = torch.tensor(0).to(means3D.device).repeat(means3D.shape[0], 1)
+        means3D_deform, _, _, _, _ = self._deformation(means3D, self._scaling, self._rotation, self._opacity, time)
+        mask = torch.norm(means3D_deform - means3D, dim=-1)
         self._deformation_table = mask > min(torch.quantile(mask, 0.7), self.mask_threshold)
         return mask
     

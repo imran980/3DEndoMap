@@ -118,7 +118,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     print("writing rendered depth images.")
     if len(render_depths) != 0:
         for image in tqdm(render_depths):
-            image = image.float() / 255.0
+            image = image.float()
+            image = (image - image.min()) / (image.max() - image.min() + 1e-8)
             torchvision.utils.save_image(image, os.path.join(depth_path, '{0:05d}'.format(count) + ".png"))
             count += 1
             
@@ -127,7 +128,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     print("writing gt depth images.")
     if len(gt_depths) != 0:
         for image in tqdm(gt_depths):
-            image = image.float() / 255.0            
+            image = image.float()
+            image = (image - image.min()) / (image.max() - image.min() + 1e-8)
             torchvision.utils.save_image(image, os.path.join(gtdepth_path, '{0:05d}'.format(count) + ".png"))
             count += 1
             
@@ -190,7 +192,7 @@ def reconstruct_point_cloud(images, masks, depths, camera_parameters, name, pcd_
         rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(rgb_im, depth_im, convert_rgb_to_intensity=False)
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
             rgbd_image,
-            o3d.camera.PinholeCameraIntrinsic(width, height, focal_x, focal_y, width / 2, width / 2),
+            o3d.camera.PinholeCameraIntrinsic(width, height, focal_x, focal_y, width / 2, height / 2),
             project_valid_depth_only=True
         )
         pc_path = os.path.join(pcd_path, 'frame_{}.ply'.format(i_frame))

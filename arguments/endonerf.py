@@ -1,6 +1,6 @@
 ModelParams = dict(
     camera_extent = 10,
-    use_pretrain=True
+    use_pretrain=False
 )
 OptimizationParams = dict(
 
@@ -10,7 +10,7 @@ OptimizationParams = dict(
     deformation_lr_delay_mult = 0.01,
     grid_lr_init = 0.0016,
     grid_lr_final = 0.000016,
-    iterations = 3000,
+    iterations = 12000,
     percent_dense = 0.01,
     render_process=True,
     densify_until_iter = 1500,
@@ -45,7 +45,12 @@ ModelHiddenParams = dict(
     weight_decay_iteration=0,
     bounds=1.6,
     pool_list=[2],
-    multi_scale=False
+    multi_scale=False,
+    # Phase 2: Class-conditioned deformation
+    use_class_deformation=True,
+    semantic_consistency_weight=0.01,
+    cutting_threshold=0.1,
+    label_update_interval=100,
 )
 
 PipelineParams = dict(

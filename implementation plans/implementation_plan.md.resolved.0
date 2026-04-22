@@ -1,0 +1,86 @@
+# Step 1: Inner Surface Reconstruction from Endoscopic Video
+
+## Background
+
+The goal is to build a **surgical navigation "GPS"** pipeline. Step 1 focuses on reconstructing the inner surface of an organ from endoscopic video and producing a unified 3D mesh + camera trajectory that can later be registered to a pre-op CT/MRI model.
+
+### Two complementary tools
+
+| Capability | Endo-4DGS | EndoGSLAM |
+|---|---|---|
+| **Deformable tissue modeling** | ✅ HexPlane 4D deformation | ❌ Static Gaussians only |
+| **Camera pose tracking (SLAM)** | ❌ Requires known poses | ✅ Real-time tracking |
+| **Depth estimation** | ✅ Rendered + Depth Anything | ✅ From RGBD |
+| **Dense 3D reconstruction** | ✅ Per-frame point clouds (`--pc`) | ✅ Incremental map |
+| **Real-time** | ❌ Offline training | ✅ >100 fps rendering |
+| **Dataset** | EndoNeRF (known poses) | C3VD (colonoscopy) |
+
+**Key insight**: Endo-4DGS handles deformation but needs pre-computed camera poses. EndoGSLAM provides real-time camera tracking but assumes static scenes. For your GPS system, you need **both** — camera localization AND deformation-aware reconstruction.
+
+## User Review Required
+
+> [!IMPORTANT]
+> This plan has **two possible approaches**. Please choose which direction you want:
+
+### Option A: Quick — Extract 3D mesh from your existing Endo-4DGS training (recommended to start)
+- Use the **already trained** pulling/cutting models
+- Run rendering with `--pc` to export per-frame point clouds
+- Fuse them into a single mesh using Open3D (TSDF fusion or Poisson reconstruction)
+- Export camera trajectory from the known poses
+- **Result**: A colored 3D mesh + camera path, ready for CT registration in Step 2
+- **Effort**: ~1-2 scripts, works today
+
+### Option B: Full pipeline — Integrate EndoGSLAM for real-time SLAM + Endo-4DGS for deformation
+- Clone and set up EndoGSLAM in a separate environment
+- Run EndoGSLAM on your endoscopy video to get camera poses + initial reconstruction
+- Feed those poses into Endo-4DGS for deformation-aware refinement
+- **Result**: A complete real-time capable pipeline
+- **Effort**: Significant integration work, new dataset format needed
+
+> [!NOTE]
+> I recommend starting with **Option A** to get a working 3D reconstruction quickly, then upgrading to Option B for real-time capability later.
+
+## Proposed Changes (Option A)
+
+### Surface Reconstruction Script
+
+#### [NEW] [extract_surface.py](file:///home/mi3dr/Endo-4DGS/extract_surface.py)
+
+A script that:
+1. Loads a trained Endo-4DGS model
+2. Renders all views with depth maps (already works via `render.py --pc`)
+3. Performs **TSDF volume fusion** across all frames using Open3D:
+   - Back-projects each depth map to 3D using known camera intrinsics/extrinsics
+   - Integrates all frames into a TSDF volume
+   - Extracts a watertight triangle mesh via marching cubes
+4. Saves the fused mesh as [.ply](file:///home/mi3dr/Endo-4DGS/data/endonerf/pulling_soft_tissues/points3d.ply) and camera trajectory as `.json`
+5. Optionally launches an Open3D visualizer showing the mesh + camera path
+
+### Camera Trajectory Export
+
+#### [NEW] [export_cameras.py](file:///home/mi3dr/Endo-4DGS/export_cameras.py)
+
+A script that:
+1. Loads the EndoNeRF dataset poses ([poses_bounds.npy](file:///home/mi3dr/Endo-4DGS/data/endonerf/pulling_soft_tissues/poses_bounds.npy))
+2. Exports camera positions and orientations per frame as a JSON trajectory
+3. This trajectory is what gets mapped onto the CT model in Step 2
+
+## Verification Plan
+
+### Automated Tests
+```bash
+# 1. Generate per-frame point clouds (already verified working)
+python render.py --model_path output/endonerf/pulling --skip_video --pc --configs arguments/endonerf.py
+
+# 2. Run surface extraction (new script)
+python extract_surface.py --model_path output/endonerf/pulling --iteration 3000
+
+# 3. Verify output files exist
+ls output/endonerf/pulling/surface_reconstruction/
+# Expected: fused_mesh.ply, camera_trajectory.json
+```
+
+### Manual Verification
+- Open `fused_mesh.ply` in MeshLab or Open3D visualizer to visually confirm it looks like the inner tissue surface
+- The mesh should show the tissue without surgical tools (since tools were masked during training)
+- Camera trajectory points should form a plausible path along the surface

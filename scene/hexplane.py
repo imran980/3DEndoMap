@@ -49,7 +49,7 @@ def grid_sample_wrapper(grid: torch.Tensor, coords: torch.Tensor,
     # print(interp.shape)
     # print('')
     interp = interp.view(B, feature_dim, n).transpose(-1, -2)  # [B, n, feature_dim]
-    interp = interp.squeeze()  # [B?, n, feature_dim?]
+    interp = interp.squeeze(0)  # [B?, n, feature_dim?]
     return interp
 
 

@@ -1,0 +1,6 @@
+{
+  "artifactType": "ARTIFACT_TYPE_IMPLEMENTATION_PLAN",
+  "summary": "Step 3 implementation plan: real-time camera localization. Given a new endoscopic frame, render from all training viewpoints to find the best match, then display that position on the registered organ model.",
+  "updatedAt": "2026-04-12T19:59:10.855165067Z",
+  "version": "2"
+}

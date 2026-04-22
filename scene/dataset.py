@@ -36,10 +36,11 @@ class FourDGSdataset(Dataset):
             Zfar = caminfo.Zfar
             time = caminfo.time
             pc = caminfo.pc
+            semantic_mask = getattr(caminfo, 'semantic_mask', None)
         
         return Camera(colmap_id=index,R=R,T=T,FoVx=FovX,FoVy=FovY,image=image, depth=depth,mask=mask,gt_alpha_mask=None,
                           image_name=f"{index}",uid=index,data_device=torch.device("cuda"),time=time,
-                          Znear=Znear, Zfar=Zfar, pc=pc)
+                          Znear=Znear, Zfar=Zfar, pc=pc, semantic_mask=semantic_mask)
     
     def __len__(self):
         return len(self.dataset)

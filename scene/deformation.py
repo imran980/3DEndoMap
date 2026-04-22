@@ -2,7 +2,7 @@ import functools
 import math
 import os
 import time
-from tkinter import W
+
 
 import numpy as np
 import torch
@@ -26,6 +26,7 @@ class Deformation(nn.Module):
         self.grid = HexPlaneField(args.bounds, args.kplanes_config, args.multires)
         
         self.args = args
+        self.use_class_deformation = getattr(args, 'use_class_deformation', False)
         if self.args.static_mlp:
             self.static_mlp = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 1))
         
@@ -57,12 +58,17 @@ class Deformation(nn.Module):
             self.feature_out.append(nn.ReLU())
             self.feature_out.append(nn.Linear(self.W,self.W))
         self.feature_out = nn.Sequential(*self.feature_out)
-        # decoder
+        # Elastic decoder heads (tissue/vessel - full deformation)
         self.pos_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 3))
         self.scales_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 3))
         self.rotations_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 4))
         self.opacity_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 1))
         self.shs_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 16*3))
+        
+        # Phase 2: Rigid decoder heads (tools - rotation + translation only)
+        if self.use_class_deformation:
+            self.rigid_pos_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 3))
+            self.rigid_rotations_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 4))
 
     def query_time(self, rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb):
         
@@ -82,18 +88,18 @@ class Deformation(nn.Module):
     def get_empty_ratio(self):
         return self.ratio
     
-    def forward(self, rays_pts_emb, scales_emb=None, rotations_emb=None, opacity = None,shs_emb=None, time_feature=None, time_emb=None):
+    def forward(self, rays_pts_emb, scales_emb=None, rotations_emb=None, opacity = None,shs_emb=None, time_feature=None, time_emb=None, semantic_labels=None):
         if time_emb is None:
             return self.forward_static(rays_pts_emb[:,:3])
         else:
-            return self.forward_dynamic(rays_pts_emb, scales_emb, rotations_emb, opacity, shs_emb, time_feature, time_emb)
+            return self.forward_dynamic(rays_pts_emb, scales_emb, rotations_emb, opacity, shs_emb, time_feature, time_emb, semantic_labels)
 
     def forward_static(self, rays_pts_emb):
         grid_feature = self.grid(rays_pts_emb[:,:3])
         dx = self.static_mlp(grid_feature)
         return rays_pts_emb[:, :3] + dx
     
-    def forward_dynamic(self, rays_pts_emb, scales_emb, rotations_emb, opacity_emb, shs_emb, time_feature, time_emb):
+    def forward_dynamic(self, rays_pts_emb, scales_emb, rotations_emb, opacity_emb, shs_emb, time_feature, time_emb, semantic_labels=None):
         hidden = self.query_time(rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb)
         if self.args.static_mlp:
             mask = self.static_mlp(hidden)
@@ -101,6 +107,14 @@ class Deformation(nn.Module):
             mask = self.empty_voxel(rays_pts_emb[:,:3])
         else:
             mask = torch.ones_like(opacity_emb[:,0]).unsqueeze(-1)
+        
+        # Phase 2: Class-conditioned deformation routing
+        if self.use_class_deformation and semantic_labels is not None:
+            return self._forward_class_conditioned(
+                hidden, mask, rays_pts_emb, scales_emb, rotations_emb, 
+                opacity_emb, shs_emb, semantic_labels)
+        
+        # Original path (no class conditioning)
         if self.args.no_dx:
             pts = rays_pts_emb[:,:3]
         else:
@@ -141,6 +155,79 @@ class Deformation(nn.Module):
 
         return pts, scales, rotations, opacity, shs
     
+    def _forward_class_conditioned(self, hidden, mask, rays_pts_emb, scales_emb, 
+                                    rotations_emb, opacity_emb, shs_emb, semantic_labels):
+        """Route Gaussians through class-specific decoder heads.
+        
+        Class 0 (background): pass through unchanged
+        Class 1 (tool): rigid decoder (position + rotation only)
+        Class 2 (tissue): elastic decoder (full deformation)
+        """
+        N = hidden.shape[0]
+        device = hidden.device
+        
+        # Initialize outputs as pass-through
+        pts = rays_pts_emb[:,:3].clone()
+        scales = scales_emb[:,:3].clone()
+        rotations = rotations_emb[:,:4].clone()
+        opacity = opacity_emb[:,:1].clone()
+        shs = shs_emb.clone()
+        
+        # Tool mask (label == 1) -> rigid decoder
+        tool_mask = (semantic_labels == 1)
+        if tool_mask.any():
+            h_tool = hidden[tool_mask]
+            m_tool = mask[tool_mask] if mask.shape[0] == N else mask
+            
+            # Rigid position deformation
+            if not self.args.no_dx:
+                dx_rigid = self.rigid_pos_deform(h_tool)
+                pts[tool_mask] = rays_pts_emb[tool_mask, :3] * m_tool + dx_rigid
+            
+            # Rigid rotation deformation
+            if not self.args.no_dr:
+                dr_rigid = self.rigid_rotations_deform(h_tool)
+                if self.args.apply_rotation:
+                    rotations[tool_mask] = batch_quaternion_multiply(
+                        rotations_emb[tool_mask], dr_rigid)
+                else:
+                    rotations[tool_mask] = rotations_emb[tool_mask, :4] + dr_rigid
+            # Tool: no scale, opacity, or SH deformation (rigid body)
+        
+        # Tissue/vessel mask (label == 2) -> elastic decoder
+        tissue_mask = (semantic_labels == 2)
+        if tissue_mask.any():
+            h_tissue = hidden[tissue_mask]
+            m_tissue = mask[tissue_mask] if mask.shape[0] == N else mask
+            
+            if not self.args.no_dx:
+                dx_elastic = self.pos_deform(h_tissue)
+                pts[tissue_mask] = rays_pts_emb[tissue_mask, :3] * m_tissue + dx_elastic
+            
+            if not self.args.no_ds:
+                ds_elastic = self.scales_deform(h_tissue)
+                scales[tissue_mask] = scales_emb[tissue_mask, :3] * m_tissue + ds_elastic
+            
+            if not self.args.no_dr:
+                dr_elastic = self.rotations_deform(h_tissue)
+                if self.args.apply_rotation:
+                    rotations[tissue_mask] = batch_quaternion_multiply(
+                        rotations_emb[tissue_mask], dr_elastic)
+                else:
+                    rotations[tissue_mask] = rotations_emb[tissue_mask, :4] + dr_elastic
+            
+            if not self.args.no_do:
+                do_elastic = self.opacity_deform(h_tissue)
+                opacity[tissue_mask] = opacity_emb[tissue_mask, :1] * m_tissue + do_elastic
+            
+            if not self.args.no_dshs:
+                dshs_elastic = self.shs_deform(h_tissue).reshape([-1, 16, 3])
+                shs[tissue_mask] = shs_emb[tissue_mask] * m_tissue.unsqueeze(-1) + dshs_elastic
+        
+        # Background (label == 0): already pass-through from initialization
+        
+        return pts, scales, rotations, opacity, shs
+    
     def get_mlp_parameters(self):
         parameter_list = []
         for name, param in self.named_parameters():
@@ -177,8 +264,8 @@ class deform_network(nn.Module):
         self.register_buffer('opacity_poc', torch.FloatTensor([(2**i) for i in range(opacity_pe)]))
         self.apply(initialize_weights)
 
-    def forward(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None):
-        return self.forward_dynamic(point, scales, rotations, opacity, shs, times_sel)
+    def forward(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None, semantic_labels=None):
+        return self.forward_dynamic(point, scales, rotations, opacity, shs, times_sel, semantic_labels)
     @property
     def get_aabb(self):
         
@@ -191,7 +278,7 @@ class deform_network(nn.Module):
         points = self.deformation_net(points)
         return points
     
-    def forward_dynamic(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None):        
+    def forward_dynamic(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None, semantic_labels=None):        
         point_emb = poc_fre(point, self.pos_poc)
         scales_emb = poc_fre(scales, self.rotation_scaling_poc)
         rotations_emb = poc_fre(rotations, self.rotation_scaling_poc)
@@ -201,7 +288,8 @@ class deform_network(nn.Module):
                                                 opacity,
                                                 shs,
                                                 None,
-                                                times_sel)
+                                                times_sel,
+                                                semantic_labels)
         return means3D, scales, rotations, opacity, shs
     def get_mlp_parameters(self):
         return self.deformation_net.get_mlp_parameters() + list(self.timenet.parameters())
@@ -212,7 +300,7 @@ def initialize_weights(m):
     if isinstance(m, nn.Linear):
         init.xavier_uniform_(m.weight,gain=1)
         if m.bias is not None:
-            init.xavier_uniform_(m.weight,gain=1)
+            init.zeros_(m.bias)
             
 def poc_fre(input_data, poc_buf):
 

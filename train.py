@@ -117,7 +117,8 @@ def scene_reconstruction(mp, opt, hyper, pipe, testing_iterations, saving_iterat
         load_in_memory = False 
     
     count = 0
-    for iteration in range(first_iter, final_iter+1):        
+    for iteration in range(first_iter, final_iter+1):
+        count += 1
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -183,7 +184,6 @@ def scene_reconstruction(mp, opt, hyper, pipe, testing_iterations, saving_iterat
         # silog_loss = SILogLoss()
         grad_loss = GradL1Loss()
         avg_filter = torch.nn.AvgPool2d(2)
-        jump = False
         # SSI_loss = ScaleAndShiftInvariantLoss()
         for viewpoint_cam in viewpoint_cams:
             # pc = viewpoint_cam.pc.cuda()
@@ -231,7 +231,8 @@ def scene_reconstruction(mp, opt, hyper, pipe, testing_iterations, saving_iterat
         if len(masks) != 0:
             mask_tensor = torch.cat(masks, 0)
         else:
-            mask_tensor = None
+            # Create an all-ones mask when no masks are provided
+            mask_tensor = torch.ones_like(torch.cat(images, 0))
         
         image_tensor = torch.cat(images,0) * mask_tensor
         depth_tensor = torch.cat(depths, 0) * mask_tensor
@@ -287,8 +288,6 @@ def scene_reconstruction(mp, opt, hyper, pipe, testing_iterations, saving_iterat
             ssim_loss = ssim(image_tensor, gt_image_tensor)
             loss += opt.lambda_dssim * (1.0-ssim_loss)
             
-        loss.backward()
-            
         if torch.isnan(loss).any():
             print("loss is nan,end training, reexecv program now.")
             loss_dict = {"Loss": f"{Ll1.item():.{4}f}",
@@ -309,12 +308,12 @@ def scene_reconstruction(mp, opt, hyper, pipe, testing_iterations, saving_iterat
             print(loss_dict)
             
             os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        loss.backward()
+
         viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
         for idx in range(0, len(viewspace_point_tensor_list)):
-            if jump:
-                viewspace_point_tensor_grad = viewspace_point_tensor_grad
-            else:
-                viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
+            viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
         iter_end.record()
         torch.cuda.synchronize()
 
@@ -324,7 +323,7 @@ def scene_reconstruction(mp, opt, hyper, pipe, testing_iterations, saving_iterat
             if iteration % 10 == 0:
                 string_dict = {"Loss": f"{Ll1.item():.{4}f}",
                                         "psnr": f"{psnr_:.{2}f}"}
-                if stage == 'fine':
+                if stage == 'fine' and hyper.time_smoothness_weight != 0:
                     string_dict['tv'] = f"{tv_loss:.{4}f}"
                 if use_depth:
                     string_dict["Dep"] = f"{depth_loss:.{4}f}"
@@ -439,7 +438,7 @@ def prepare_output_and_logger(expname):
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, stage, dataset_type):
     if tb_writer:
         tb_writer.add_scalar(f'{stage}/train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar(f'{stage}/train_loss_patchestotal_loss', loss.item(), iteration)
+        tb_writer.add_scalar(f'{stage}/train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{stage}/iter_time', elapsed, iteration)
         
     

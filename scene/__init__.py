@@ -44,7 +44,8 @@ class Scene:
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args.use_pretrain)
         elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")) and (not 'endo' in args.source_path):
-            scene_info = sceneLoadTypeCallbacks["dynerf"](args.source_path, args.white_background, args.eval, args.use_pretrain)
+            # scene_info = sceneLoadTypeCallbacks["dynerf"](args.source_path, args.white_background, args.eval, args.use_pretrain)
+            scene_info = sceneLoadTypeCallbacks["dynerf"](args.source_path, args.white_background, args.eval)
         elif os.path.exists(os.path.join(args.source_path,"dataset.json")):
             scene_info = sceneLoadTypeCallbacks["nerfies"](args.source_path, False, args.eval, args.use_pretrain)
         elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")) and 'endo' in args.source_path:

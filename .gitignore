@@ -16,4 +16,6 @@ __pycache__/
 reconstruct/
 *.so
 data/
+dataset/
+*.pt
 pretrained_gaussians/

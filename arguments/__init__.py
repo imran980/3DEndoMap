@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import ast
 from argparse import ArgumentParser, Namespace
 import sys
 import os
@@ -115,6 +116,11 @@ class ModelHiddenParams(ParamGroup):
         self.static_mlp=False
         self.apply_rotation=False
         self.multi_scale=False
+        # Phase 2: Class-conditioned deformation
+        self.use_class_deformation=False
+        self.semantic_consistency_weight=0.01
+        self.cutting_threshold=0.1
+        self.label_update_interval=100
         super().__init__(parser, "ModelHiddenParams")
         
 class OptimizationParams(ParamGroup):
@@ -173,10 +179,14 @@ def get_combined_args(parser : ArgumentParser):
     except TypeError:
         print("Config file not found at")
         pass
-    args_cfgfile = eval(cfgfile_string)
+    # cfg_args contains Namespace(...) calls, so we must use eval but restrict namespace
+    args_cfgfile = eval(cfgfile_string, {"__builtins__": {}}, {"Namespace": Namespace})
 
     merged_dict = vars(args_cfgfile).copy()
     for k,v in vars(args_cmdline).items():
-        if v != None:
+        if v is not None:
+            merged_dict[k] = v
+        elif k not in merged_dict:
+            # Preserve command-line args with None defaults that aren't in cfg_args
             merged_dict[k] = v
     return Namespace(**merged_dict)

@@ -46,6 +46,7 @@ class CameraInfo(NamedTuple):
     Zfar: float
     Znear: float
     pc: np.array
+    semantic_mask: np.array = None
 
 def normalize(v):
     """Normalize a vector."""
@@ -231,6 +232,15 @@ class EndoNeRF_Dataset(object):
         else:
             self.depth_paths = agg_fn("depth_dam")
         self.mask_paths = agg_fn("masks")
+        
+        # Load semantic mask paths (Phase 2)
+        semantic_dir = os.path.join(self.root_dir, "semantic_masks")
+        if os.path.isdir(semantic_dir):
+            self.semantic_mask_paths = sorted(glob.glob(os.path.join(semantic_dir, "*.png")))
+            print(f"Found {len(self.semantic_mask_paths)} semantic masks")
+        else:
+            self.semantic_mask_paths = []
+            print("No semantic masks found, class-conditioned deformation disabled")
 
 
         assert len(self.image_paths) == poses.shape[0], "the number of images should equal to the number of poses"
@@ -276,6 +286,14 @@ class EndoNeRF_Dataset(object):
             depth_es = torch.from_numpy(np.ascontiguousarray(depth_es))
             mask = torch.from_numpy(np.ascontiguousarray(mask)).bool()
             image = self.transform(np.ascontiguousarray(color))
+            
+            # Load semantic mask (Phase 2)
+            semantic_mask = None
+            if len(self.semantic_mask_paths) > 0 and idx < len(self.semantic_mask_paths):
+                sem_img = cv2.imread(self.semantic_mask_paths[idx], cv2.IMREAD_GRAYSCALE)
+                if sem_img is not None:
+                    semantic_mask = torch.from_numpy(np.ascontiguousarray(sem_img)).long()
+            
             # times           
             time = self.image_times[idx]
             # poses
@@ -286,7 +304,7 @@ class EndoNeRF_Dataset(object):
             
             cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image, depth=depth_es, mask=mask,
                                 image_path=self.image_paths[idx], image_name=self.image_paths[idx], width=image.shape[2], height=image.shape[1],
-                                time=time, Znear=None, Zfar=None, pc=pc))
+                                time=time, Znear=None, Zfar=None, pc=pc, semantic_mask=semantic_mask))
     
         return cameras
 
@@ -464,7 +482,7 @@ class SCARED_Dataset(object):
             FovY = focal2fov(focal_y, self.img_wh[1])
             cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image, depth=depth, mask=mask,
                                 image_path=None, image_name=None, width=self.img_wh[0], height=self.img_wh[1],
-                                time=time, Znear=self.depth_near_thresh, Zfar=self.depth_far_thresh))
+                                time=time, Znear=self.depth_near_thresh, Zfar=self.depth_far_thresh, pc=None))
         return cameras
             
     def generate_cameras(self, mode='fixidentity'):
