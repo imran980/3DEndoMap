@@ -113,7 +113,7 @@ def build_poses_bounds(c2w_list, H, W, focal, near=0.01, far=100.0):
 
 
 def prepare_c3vd(c3vd_dir, organ_model_path, output_dir,
-                 focal_length=None, near=0.01, far=100.0,
+                 focal_length=None, hfov_deg=None, near=None, far=None,
                  skip_every=1, max_frames=None):
     """
     Convert C3VD sequence to EndoNeRF format for Endo-4DGS.
@@ -175,15 +175,15 @@ def prepare_c3vd(c3vd_dir, organ_model_path, output_dir,
     # ---- Estimate focal length ----
     if focal_length is None:
         # C3VD colonoscope (Olympus CF-HQ190L) has wide FOV ~140-170 degrees.
-        # For the rendered/registered images, approximate with pinhole.
-        # f ≈ W * 0.5 gives ~90 degree hFOV — reasonable starting point.
-        # Adjust if reconstruction quality is poor.
-        focal_length = W * 0.5
+        # Default to 140° hFOV — a good starting point for the C3VD phantom
+        # sequences. Override with --hfov or --focal if calibration differs.
+        fov_used = hfov_deg if hfov_deg is not None else 140.0
+        focal_length = W / (2.0 * np.tan(np.radians(fov_used) / 2.0))
         print(f"  Auto focal length: {focal_length:.1f} px "
-              f"(~{2*np.degrees(np.arctan(W/(2*focal_length))):.0f}° hFOV)")
-        print(f"  TIP: For better accuracy, extract from C3VD calibration file")
+              f"(~{fov_used:.0f}° hFOV)")
     else:
-        print(f"  Focal length: {focal_length:.1f} px")
+        print(f"  Focal length: {focal_length:.1f} px "
+              f"(~{2*np.degrees(np.arctan(W/(2*focal_length))):.0f}° hFOV)")
     
     # ---- Copy RGB frames ----
     images_dir = os.path.join(output_dir, "images")
@@ -203,10 +203,33 @@ def prepare_c3vd(c3vd_dir, organ_model_path, output_dir,
     for i in range(n):
         cv2.imwrite(os.path.join(masks_dir, f"frame_{i:05d}.png"), white_mask)
     
+    # ---- Auto near/far from C3VD 16-bit depth (0-100 mm linear) ----
+    if near is None or far is None:
+        depth_src = os.path.join(c3vd_dir, "depth")
+        auto_near, auto_far = None, None
+        if os.path.isdir(depth_src):
+            dfiles = sorted(glob.glob(os.path.join(depth_src, "*.png")))
+            samples = []
+            for dp in dfiles[::max(1, len(dfiles) // 20)][:20]:
+                dimg = cv2.imread(dp, cv2.IMREAD_UNCHANGED)
+                if dimg is not None and dimg.size > 0:
+                    # C3VD depth: 16-bit, encodes 0-100 mm linearly
+                    dmm = dimg.astype(np.float32) * (100.0 / 65535.0)
+                    valid = dmm[(dmm > 0.1) & (dmm < 100.0)]
+                    if valid.size > 0:
+                        samples.extend(valid.flatten()[:2000].tolist())
+            if samples:
+                auto_near = max(0.5, float(np.percentile(samples, 1)) * 0.8)
+                auto_far = float(np.percentile(samples, 99)) * 1.2
+        if near is None:
+            near = auto_near if auto_near is not None else 1.0
+        if far is None:
+            far = auto_far if auto_far is not None else 120.0
+
     # ---- Build poses_bounds.npy ----
     print(f"\nBuilding poses_bounds.npy")
-    print(f"  Focal={focal_length:.1f}, Near={near}, Far={far}")
-    
+    print(f"  Focal={focal_length:.1f}, Near={near:.3f}, Far={far:.3f}")
+
     poses_bounds = build_poses_bounds(all_poses, H, W, focal_length, near, far)
     
     pb_path = os.path.join(output_dir, "poses_bounds.npy")
@@ -297,9 +320,13 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", default="data/c3vd/trans_t1_b",
                         help="Output directory")
     parser.add_argument("--focal", default=None, type=float,
-                        help="Focal length in pixels (default: auto)")
-    parser.add_argument("--near", default=0.01, type=float)
-    parser.add_argument("--far", default=100.0, type=float)
+                        help="Focal length in pixels (overrides --hfov)")
+    parser.add_argument("--hfov", default=None, type=float,
+                        help="Horizontal FOV in degrees (default: 140 for C3VD)")
+    parser.add_argument("--near", default=None, type=float,
+                        help="Near bound (mm). Default: auto from C3VD GT depth")
+    parser.add_argument("--far", default=None, type=float,
+                        help="Far bound (mm). Default: auto from C3VD GT depth")
     parser.add_argument("--skip_every", default=1, type=int,
                         help="Use every N-th frame")
     parser.add_argument("--max_frames", default=None, type=int)
@@ -310,6 +337,7 @@ if __name__ == "__main__":
         organ_model_path=args.organ_model,
         output_dir=args.output_dir,
         focal_length=args.focal,
+        hfov_deg=args.hfov,
         near=args.near, far=args.far,
         skip_every=args.skip_every,
         max_frames=args.max_frames,
