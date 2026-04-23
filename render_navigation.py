@@ -319,20 +319,42 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
     os.makedirs(frames_dir, exist_ok=True)
     
     print(f"\nRendering {n_frames} frames → {video_path}")
+    first_frame_stats_printed = False
     with torch.no_grad():
         for idx in tqdm(range(n_frames), desc="Dashboard"):
             view = views[idx]
 
-            # ---- Render endo view ----
+            # ---- Render endo view (same path as render.py) ----
             result = render(view, gaussians, pipeline, background, mode='test')
-            rgb = result["render"].cpu().permute(1, 2, 0).numpy()
+            rgb_t = result["render"].detach().cpu()  # CxHxW, float
             depth = result["depth"].cpu().squeeze().numpy()
 
-            # Always run percentile auto-exposure — endoscopic renders are dark
-            # and the raw Gaussian output often has max < 0.5. This shows the
-            # reconstructed 3D scene clearly regardless of absolute brightness.
-            rgb_vis = auto_exposure(rgb, low_pct=1.0, high_pct=99.5, gamma=0.85)
-            rgb_u8 = (rgb_vis * 255).astype(np.uint8)
+            # Torchvision-style conversion: exactly what render.py saves
+            rgb_u8 = (rgb_t.clamp(0, 1).mul(255).add_(0.5)
+                          .clamp_(0, 255).permute(1, 2, 0).byte().numpy())
+
+            # Safety net: if the Gaussian render is essentially empty
+            # (e.g. wrong iteration, unconverged model), fall back to GT so
+            # the panel isn't a solid color. Can be disabled.
+            render_is_blank = float(rgb_t.max()) < 0.02
+            used_fallback = False
+            if render_is_blank and view.original_image is not None:
+                gt_t = view.original_image.detach().cpu().clamp(0, 1)
+                rgb_u8 = (gt_t.mul(255).add_(0.5).clamp_(0, 255)
+                              .permute(1, 2, 0).byte().numpy())
+                used_fallback = True
+
+            if not first_frame_stats_printed:
+                print(f"  First render: max={float(rgb_t.max()):.3f}, "
+                      f"mean={float(rgb_t.mean()):.3f}, "
+                      f"depth max={float(depth.max()):.3f}, "
+                      f"depth mean>0={float(depth[depth>0].mean() if (depth>0).any() else 0):.3f}")
+                if render_is_blank:
+                    print("  WARNING: rendered image is near-black — "
+                          "check that --iteration points to a trained checkpoint. "
+                          "Falling back to GT for the endo panel.")
+                first_frame_stats_printed = True
+
             rgb_bgr = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
 
             # Per-frame valid mask (pixels where Gaussians covered the ray)
@@ -345,7 +367,9 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
             depth_panel = cv2.resize(depth_colored, (left_panel_w, left_panel_h))
 
             # Labels on endo panel
-            cv2.putText(endo_panel, "ENDOSCOPIC VIEW", (10, 28),
+            endo_label = "ENDOSCOPIC VIEW (GT fallback)" if used_fallback \
+                else "ENDOSCOPIC VIEW"
+            cv2.putText(endo_panel, endo_label, (10, 28),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 200), 2)
             pct = idx / max(1, n_frames - 1) * 100
             cv2.putText(endo_panel, f"Frame {idx}/{n_frames-1}",
