@@ -383,13 +383,45 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
         fy = fov2focal(view0.FoVy, H0)
         tsdf_intrinsic = o3d.camera.PinholeCameraIntrinsic(
             W0, H0, fx, fy, W0 / 2.0, H0 / 2.0)
-        # Rough depth range for C3VD-scale scenes; we rely on the renderer's
-        # depth being in the same units as camera translations (mm).
-        depth_trunc = float(np.linalg.norm(
-            cam_positions.max(0) - cam_positions.min(0)) + 150.0)
+
+        # ---- Figure out the real depth scale from a few sample renders ----
+        # Scene coordinates in 3DGS are normalized, so the renderer's depth
+        # is NOT in mm. Measure it directly and size the TSDF voxels/bounds
+        # accordingly. --voxel_size / --mesh_update_every still win if the
+        # caller passes them explicitly.
+        with torch.no_grad():
+            samples = []
+            for si in range(0, n_frames, max(1, n_frames // 8))[:8]:
+                r = render(views[si], gaussians, pipeline, background,
+                           mode='test')
+                d = r["depth"].detach().cpu().squeeze().numpy()
+                vd = d[d > 0]
+                if vd.size:
+                    samples.extend(vd.flatten()[:3000].tolist())
+        if samples:
+            d99 = float(np.percentile(samples, 99))
+            d01 = float(np.percentile(samples, 1))
+        else:
+            d99, d01 = 10.0, 0.01
+        auto_depth_trunc = max(d99 * 1.3, d01 + 1e-3)
+        auto_depth_min = max(d01 * 0.5, 1e-4)
+        # Target ~350 voxels across the observed depth range for a crisp
+        # but memory-sane mesh.
+        auto_voxel = (d99 - d01) / 350.0
+        auto_voxel = max(auto_voxel, 1e-4)
+
+        # If user left defaults (voxel_size=0.5 is the old mm default), honor
+        # the auto value. Respect any explicit override that's clearly
+        # scene-scale.
+        final_voxel = voxel_size if voxel_size < 0.3 else auto_voxel
         organ_builder = DynamicOrganBuilder(
-            voxel_size=voxel_size, depth_trunc=depth_trunc, depth_min=0.5)
-        print(f"  TSDF volume: voxel={voxel_size} mm, depth_trunc={depth_trunc:.0f} mm")
+            voxel_size=final_voxel,
+            depth_trunc=auto_depth_trunc,
+            depth_min=auto_depth_min,
+        )
+        print(f"  TSDF volume: voxel={final_voxel:.4f} scene-units, "
+              f"depth=[{auto_depth_min:.3f}, {auto_depth_trunc:.3f}]  "
+              f"(raw depth p1={d01:.3f}, p99={d99:.3f})")
 
     # ---- Coverage setup (updated incrementally in the render loop) ----
     # Coverage is only meaningful when the organ is static and known. In
