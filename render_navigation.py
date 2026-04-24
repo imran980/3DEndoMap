@@ -31,6 +31,8 @@ from arguments import ModelParams, PipelineParams, ModelHiddenParams, get_combin
 from gaussian_renderer import render
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
+from utils.graphics_utils import fov2focal
+from dynamic_organ import DynamicOrganBuilder
 
 import open3d as o3d
 
@@ -271,7 +273,9 @@ def render_gps_frame(gps_data, current_idx, coverage_counts=None,
 
 
 def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
-                      output_name="navigation_dashboard"):
+                      output_name="navigation_dashboard",
+                      dynamic_organ=False, voxel_size=0.5,
+                      mesh_update_every=15):
     """Main rendering pipeline."""
     print("=" * 60)
     print("SURGICAL NAVIGATION DASHBOARD")
@@ -295,25 +299,31 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
     os.makedirs(out_dir, exist_ok=True)
     
     # ---- Load organ mesh ----
-    organ_path = os.path.join(out_dir, "organ_model.ply")
-    if not os.path.exists(organ_path):
-        organ_path = "dataset/trans_model.obj"
-    
+    # In dynamic mode we skip loading the static organ entirely; the mesh
+    # will grow from per-frame TSDF fusion instead.
     organ_mesh = None
-    if os.path.exists(organ_path):
-        organ_mesh = o3d.io.read_triangle_mesh(organ_path)
-        organ_mesh.compute_vertex_normals()
-        print(f"  Organ model: {len(organ_mesh.vertices):,} vertices")
+    if dynamic_organ:
+        print("  Dynamic organ mode: organ mesh will grow from depth fusion "
+              f"(voxel {voxel_size} mm, updating every {mesh_update_every} frames)")
     else:
-        print("  WARNING: No organ model found")
+        organ_path = os.path.join(out_dir, "organ_model.ply")
+        if not os.path.exists(organ_path):
+            organ_path = "dataset/trans_model.obj"
+
+        if os.path.exists(organ_path):
+            organ_mesh = o3d.io.read_triangle_mesh(organ_path)
+            organ_mesh.compute_vertex_normals()
+            print(f"  Organ model: {len(organ_mesh.vertices):,} vertices")
+        else:
+            print("  WARNING: No organ model found")
     
     # ---- Compute organ centerline for GPS ----
-    print("\nComputing organ centerline for GPS tracking...")
     if organ_mesh is not None:
+        print("\nComputing organ centerline for GPS tracking...")
         organ_pts = np.asarray(organ_mesh.vertices)
         centerline = compute_organ_centerline(organ_mesh, n_points=200)
         print(f"  Centerline: {len(centerline)} points")
-        
+
         gps_data = {
             'organ_pts': organ_pts,
             'centerline': centerline,
@@ -321,6 +331,19 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
             'extent': organ_pts.max(axis=0) - organ_pts.min(axis=0),
             'elev': 25, 'azim': 45,
             'n_frames': n_frames,
+        }
+    elif dynamic_organ:
+        # Placeholder; populated as the TSDF volume grows. The camera
+        # trajectory bounds give us something sensible to frame the view
+        # around until the first mesh snapshot is available.
+        gps_data = {
+            'organ_pts': np.zeros((0, 3), dtype=np.float32),
+            'centerline': np.zeros((2, 3), dtype=np.float32),
+            'center': np.zeros(3),
+            'extent': np.ones(3),
+            'elev': 25, 'azim': 45,
+            'n_frames': n_frames,
+            'dynamic': True,
         }
     else:
         gps_data = None
@@ -340,8 +363,38 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
     seg_len = np.linalg.norm(np.diff(cam_positions, axis=0), axis=1)
     cum_dist = np.concatenate([[0.0], np.cumsum(seg_len)])
 
+    # In dynamic mode, seed GPS bounds with the camera trajectory so the
+    # first few frames render something sensible before the mesh catches up.
+    if dynamic_organ and gps_data is not None:
+        traj_margin = 30.0  # mm of padding around the path
+        gps_data['center'] = cam_positions.mean(axis=0)
+        gps_data['extent'] = (
+            cam_positions.max(axis=0) - cam_positions.min(axis=0)
+            + 2 * traj_margin
+        )
+
+    # ---- TSDF dynamic organ builder ----
+    organ_builder = None
+    tsdf_intrinsic = None
+    if dynamic_organ:
+        view0 = views[0]
+        W0, H0 = int(view0.image_width), int(view0.image_height)
+        fx = fov2focal(view0.FoVx, W0)
+        fy = fov2focal(view0.FoVy, H0)
+        tsdf_intrinsic = o3d.camera.PinholeCameraIntrinsic(
+            W0, H0, fx, fy, W0 / 2.0, H0 / 2.0)
+        # Rough depth range for C3VD-scale scenes; we rely on the renderer's
+        # depth being in the same units as camera translations (mm).
+        depth_trunc = float(np.linalg.norm(
+            cam_positions.max(0) - cam_positions.min(0)) + 150.0)
+        organ_builder = DynamicOrganBuilder(
+            voxel_size=voxel_size, depth_trunc=depth_trunc, depth_min=0.5)
+        print(f"  TSDF volume: voxel={voxel_size} mm, depth_trunc={depth_trunc:.0f} mm")
+
     # ---- Coverage setup (updated incrementally in the render loop) ----
-    if gps_data is not None:
+    # Coverage is only meaningful when the organ is static and known. In
+    # dynamic mode the mesh IS the observed region, so the heatmap is off.
+    if gps_data is not None and not dynamic_organ:
         organ_pts_f = gps_data['organ_pts'].astype(np.float32)
         n_organ_pts = len(organ_pts_f)
         cov_near = 1.0
@@ -439,6 +492,25 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
 
             rgb_bgr = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
 
+            # ---- Integrate this frame into the TSDF (dynamic mode) ----
+            if organ_builder is not None and not render_is_blank:
+                w2c = view.world_view_transform.transpose(0, 1) \
+                    .detach().cpu().numpy().astype(np.float64)
+                organ_builder.integrate(rgb_u8, depth, w2c, tsdf_intrinsic)
+                if (idx % mesh_update_every == 0) or (idx == n_frames - 1):
+                    mesh = organ_builder.extract_mesh()
+                    if mesh is not None:
+                        new_pts = np.asarray(mesh.vertices)
+                        gps_data['organ_pts'] = new_pts
+                        gps_data['sub_idx'] = None  # re-sample for new mesh
+                        # Keep view centered on the growing mesh + the camera
+                        # path combined so nothing falls off-screen.
+                        combined = np.vstack([new_pts, cam_positions])
+                        gps_data['center'] = combined.mean(axis=0)
+                        gps_data['extent'] = (
+                            combined.max(axis=0) - combined.min(axis=0) + 10.0
+                        )
+
             # Per-frame valid mask (pixels where Gaussians covered the ray)
             valid = depth > 0
             depth_colored, frame_vmin, frame_vmax = depth_to_colormap(
@@ -507,13 +579,15 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
                            (gps_w // 4, gps_h // 2),
                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 100, 100), 2)
 
-            # ---- Stats overlay: withdrawal timer, speed, coverage ----
+            # ---- Stats overlay: withdrawal timer, speed, coverage/mesh ----
             elapsed_s = idx / float(fps)
             dist_mm = float(cum_dist[idx])
             speed_mms = float(seg_len[idx - 1] * fps) if idx > 0 else 0.0
             cov_pct = (float(seen_any.sum())
                        / max(len(gps_data['organ_pts']), 1) * 100.0
                        if seen_any is not None else 0.0)
+            n_mesh_verts = (len(gps_data['organ_pts'])
+                            if (gps_data is not None and dynamic_organ) else 0)
 
             # HUD strip at top of GPS panel
             hud_h = 74
@@ -536,35 +610,59 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
             cv2.putText(gps_panel, f"Path  {dist_mm:6.1f} mm",
                         (int(gps_w * 0.32), 58),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 210), 1)
-            cov_color = (80, 230, 120) if cov_pct >= 80 else \
-                        ((60, 200, 230) if cov_pct >= 50 else (60, 120, 240))
-            cv2.putText(gps_panel,
-                        f"Coverage  {cov_pct:5.1f}%",
-                        (int(gps_w * 0.62), 32),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.78, cov_color, 2)
-            # Coverage progress bar
-            bar_x1, bar_x2 = int(gps_w * 0.62), int(gps_w * 0.95)
-            bar_y = 52
-            cv2.rectangle(gps_panel, (bar_x1, bar_y),
-                          (bar_x2, bar_y + 10), (50, 50, 60), -1)
-            fill_x = int(bar_x1 + (bar_x2 - bar_x1) * cov_pct / 100.0)
-            cv2.rectangle(gps_panel, (bar_x1, bar_y),
-                          (fill_x, bar_y + 10), cov_color, -1)
+            if dynamic_organ:
+                # Show reconstruction progress instead of coverage %
+                mesh_color = (80, 230, 120) if n_mesh_verts > 20000 else \
+                             ((60, 200, 230) if n_mesh_verts > 5000
+                              else (60, 120, 240))
+                cv2.putText(gps_panel,
+                            f"Mesh  {n_mesh_verts:,} pts",
+                            (int(gps_w * 0.62), 32),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.78, mesh_color, 2)
+                cv2.putText(gps_panel,
+                            f"(live TSDF fusion, {organ_builder.n_integrated}"
+                            f" frames fused)",
+                            (int(gps_w * 0.62), 58),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                            (160, 160, 170), 1)
+            else:
+                cov_color = (80, 230, 120) if cov_pct >= 80 else \
+                            ((60, 200, 230) if cov_pct >= 50
+                             else (60, 120, 240))
+                cv2.putText(gps_panel,
+                            f"Coverage  {cov_pct:5.1f}%",
+                            (int(gps_w * 0.62), 32),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.78, cov_color, 2)
+                bar_x1, bar_x2 = int(gps_w * 0.62), int(gps_w * 0.95)
+                bar_y = 52
+                cv2.rectangle(gps_panel, (bar_x1, bar_y),
+                              (bar_x2, bar_y + 10), (50, 50, 60), -1)
+                fill_x = int(bar_x1 + (bar_x2 - bar_x1) * cov_pct / 100.0)
+                cv2.rectangle(gps_panel, (bar_x1, bar_y),
+                              (fill_x, bar_y + 10), cov_color, -1)
 
-            # Legend for coverage colors (bottom of GPS panel)
+            # Legend at the bottom of the GPS panel
             leg_y = gps_h - 28
-            cv2.circle(gps_panel, (20, leg_y), 6, (60, 120, 240), -1)
-            cv2.putText(gps_panel, "missed",
-                        (32, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45, (200, 200, 210), 1)
-            cv2.circle(gps_panel, (110, leg_y), 6, (60, 230, 230), -1)
-            cv2.putText(gps_panel, "partial",
-                        (122, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45, (200, 200, 210), 1)
-            cv2.circle(gps_panel, (205, leg_y), 6, (80, 230, 120), -1)
-            cv2.putText(gps_panel, "well covered",
-                        (217, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45, (200, 200, 210), 1)
+            if dynamic_organ:
+                cv2.putText(gps_panel,
+                            "Organ surface built live from per-frame depth "
+                            "fusion (TSDF, voxel "
+                            f"{organ_builder.voxel_size:.2f} mm)",
+                            (14, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, (180, 180, 190), 1)
+            else:
+                cv2.circle(gps_panel, (20, leg_y), 6, (60, 120, 240), -1)
+                cv2.putText(gps_panel, "missed",
+                            (32, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, (200, 200, 210), 1)
+                cv2.circle(gps_panel, (110, leg_y), 6, (60, 230, 230), -1)
+                cv2.putText(gps_panel, "partial",
+                            (122, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, (200, 200, 210), 1)
+                cv2.circle(gps_panel, (205, leg_y), 6, (80, 230, 120), -1)
+                cv2.putText(gps_panel, "well covered",
+                            (217, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, (200, 200, 210), 1)
 
             # ---- Composite: [endo / depth] | [gps] ----
             canvas = np.zeros((vid_h, vid_w, 3), dtype=np.uint8)
@@ -585,7 +683,18 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
                             canvas)
     
     writer.release()
-    
+
+    # ---- Save the final dynamic mesh ----
+    final_mesh_path = None
+    if organ_builder is not None:
+        final_mesh = organ_builder.extract_mesh(min_vertices=0)
+        if final_mesh is not None and len(final_mesh.vertices) > 0:
+            final_mesh_path = os.path.join(out_dir, "dynamic_organ_mesh.ply")
+            o3d.io.write_triangle_mesh(final_mesh_path, final_mesh)
+            print(f"  Dynamic organ mesh: {final_mesh_path} "
+                  f"({len(final_mesh.vertices):,} verts, "
+                  f"{len(final_mesh.triangles):,} tris)")
+
     print(f"\n{'=' * 60}")
     print("DASHBOARD COMPLETE")
     print(f"{'=' * 60}")
@@ -593,6 +702,8 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
     print(f"  Key frames: {frames_dir}/")
     print(f"  Resolution: {vid_w}x{vid_h} @ {fps}fps")
     print(f"  Duration: {n_frames/fps:.1f}s ({n_frames} frames)")
+    if final_mesh_path:
+        print(f"  Final reconstructed mesh: {final_mesh_path}")
 
 
 if __name__ == "__main__":
@@ -603,21 +714,31 @@ if __name__ == "__main__":
     parser.add_argument("--iteration", default=3000, type=int)
     parser.add_argument("--configs", type=str, default="")
     parser.add_argument("--fps", default=30, type=int, help="Output video FPS")
-    
+    parser.add_argument("--dynamic_organ", action="store_true",
+                        help="Build organ mesh live via per-frame TSDF fusion "
+                             "instead of using a pre-op static mesh")
+    parser.add_argument("--voxel_size", default=0.5, type=float,
+                        help="TSDF voxel size in mm (dynamic_organ only)")
+    parser.add_argument("--mesh_update_every", default=15, type=int,
+                        help="Extract mesh every N frames (dynamic_organ only)")
+
     args = get_combined_args(parser)
-    
+
     if args.configs:
         import mmcv
         from utils.params_utils import merge_hparams
         config = mmcv.Config.fromfile(args.configs)
         args = merge_hparams(args, config)
-    
+
     safe_state(False)
-    
+
     render_navigation(
         model.extract(args),
         hyperparam.extract(args),
         args.iteration,
         pipeline.extract(args),
         fps=args.fps,
+        dynamic_organ=args.dynamic_organ,
+        voxel_size=args.voxel_size,
+        mesh_update_every=args.mesh_update_every,
     )
