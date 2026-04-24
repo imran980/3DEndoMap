@@ -165,11 +165,13 @@ def render_gps_frame(gps_data, current_idx, coverage_counts=None,
     n_frames = gps_data['n_frames']
 
     # Stable subsample — reuse same indices across frames so coverage colors
-    # stay consistent point-for-point throughout the video.
+    # stay consistent point-for-point throughout the video. Capped at 6000
+    # because matplotlib 3D scatter is O(N) per frame and 18k points on a
+    # 1200x900 panel is the dominant render cost.
     n_organ = len(organ_pts)
-    target_pts = 18000
+    target_pts = 6000
     sub_idx = gps_data.get('sub_idx')
-    if sub_idx is None:
+    if sub_idx is None or len(sub_idx) > n_organ:
         if n_organ > target_pts:
             sub_idx = np.random.RandomState(42).choice(
                 n_organ, target_pts, replace=False)
@@ -405,10 +407,11 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
             d99, d01 = 10.0, 0.01
         auto_depth_trunc = max(d99 * 1.3, d01 + 1e-3)
         auto_depth_min = max(d01 * 0.5, 1e-4)
-        # Target ~350 voxels across the observed depth range for a crisp
-        # but memory-sane mesh.
-        auto_voxel = (d99 - d01) / 350.0
-        auto_voxel = max(auto_voxel, 1e-4)
+        # Target ~120 voxels across the observed depth range. Going much
+        # finer than this makes mesh extraction (and the matplotlib panel
+        # that draws the resulting points) the dominant cost per frame.
+        auto_voxel = (d99 - d01) / 120.0
+        auto_voxel = max(auto_voxel, 5e-3)
 
         # If user left defaults (voxel_size=0.5 is the old mm default), honor
         # the auto value. Respect any explicit override that's clearly
@@ -600,7 +603,7 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
                                if seen_any is not None else None)
                 gps_img = render_gps_frame(
                     gps_data, idx, coverage_counts=current_cov,
-                    width=gps_w, height=gps_h, dpi=110)
+                    width=gps_w, height=gps_h, dpi=80)
                 gps_bgr = cv2.cvtColor(gps_img, cv2.COLOR_RGB2BGR)
                 if gps_bgr.shape[1] != gps_w or gps_bgr.shape[0] != gps_h:
                     gps_bgr = cv2.resize(gps_bgr, (gps_w, gps_h))
