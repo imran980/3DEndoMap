@@ -194,14 +194,17 @@ def prepare_c3vd(c3vd_dir, organ_model_path, output_dir,
         dst = os.path.join(images_dir, f"frame_{i:05d}.png")
         shutil.copy2(src, dst)
     
-    # ---- Create masks (all white — no surgical tools in C3VD phantoms) ----
+    # ---- Create masks (all BLACK — no surgical tools in C3VD phantoms) ----
+    # EndoNeRF convention: masks encode the *tool* (white = tool, ignored).
+    # scene/endo_loader.py inverts them to valid-tissue masks. For C3VD we
+    # want every pixel to be supervised → mask = 0 everywhere.
     masks_dir = os.path.join(output_dir, "masks")
     os.makedirs(masks_dir, exist_ok=True)
-    
-    print(f"Creating {n} blank masks")
-    white_mask = np.ones((H, W), dtype=np.uint8) * 255
+
+    print(f"Creating {n} blank (all-black) masks — EndoNeRF tool-mask convention")
+    black_mask = np.zeros((H, W), dtype=np.uint8)
     for i in range(n):
-        cv2.imwrite(os.path.join(masks_dir, f"frame_{i:05d}.png"), white_mask)
+        cv2.imwrite(os.path.join(masks_dir, f"frame_{i:05d}.png"), black_mask)
     
     # ---- Auto near/far from C3VD 16-bit depth (0-100 mm linear) ----
     if near is None or far is None:
