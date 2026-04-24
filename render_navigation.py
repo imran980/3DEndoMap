@@ -83,6 +83,28 @@ def auto_exposure(rgb_np, low_pct=1.0, high_pct=99.5, gamma=0.9):
     return out
 
 
+def frustum_visibility(cam_center, cam_forward, organ_pts,
+                       hfov_deg=140.0, near=1.0, far=120.0):
+    """Return a boolean array (N,) marking organ points inside this camera's
+    view frustum. Cheap cone-based approximation (no occlusion): a point is
+    "seen" if within hfov/2 of forward and between [near, far] along the ray.
+    """
+    d = organ_pts - cam_center[None, :]
+    dist = np.linalg.norm(d, axis=1)
+    safe = dist > 1e-6
+    d_norm = np.zeros_like(d)
+    d_norm[safe] = d[safe] / dist[safe, None]
+    cos_sim = d_norm @ cam_forward
+    cos_half = float(np.cos(np.radians(hfov_deg) / 2.0))
+    return safe & (cos_sim > cos_half) & (dist >= near) & (dist <= far)
+
+
+def format_time_mmss(seconds):
+    m = int(seconds // 60)
+    s = int(seconds % 60)
+    return f"{m:02d}:{s:02d}"
+
+
 def compute_organ_centerline(organ_mesh, n_points=100):
     """
     Compute a smooth centerline path through the organ using PCA
@@ -122,10 +144,14 @@ def compute_organ_centerline(organ_mesh, n_points=100):
     return np.array(centerline)
 
 
-def render_gps_frame(gps_data, current_idx, width=640, height=480, dpi=100):
+def render_gps_frame(gps_data, current_idx, coverage_counts=None,
+                     width=640, height=480, dpi=100):
     """
     Render a single GPS frame showing the organ + current camera dot.
     The dot position is interpolated along the organ's centerline.
+
+    If coverage_counts is provided, organ points are colored red (missed)
+    → yellow → green (well covered) based on how many frames saw them.
     """
     fig = plt.figure(figsize=(width/dpi, height/dpi), dpi=dpi)
     ax = fig.add_subplot(111, projection='3d')
@@ -136,18 +162,44 @@ def render_gps_frame(gps_data, current_idx, width=640, height=480, dpi=100):
     extent = gps_data['extent']
     n_frames = gps_data['n_frames']
 
-    # Subsample organ for speed (more points now that the panel is larger)
+    # Stable subsample — reuse same indices across frames so coverage colors
+    # stay consistent point-for-point throughout the video.
     n_organ = len(organ_pts)
     target_pts = 18000
-    if n_organ > target_pts:
-        idx = np.random.RandomState(42).choice(n_organ, target_pts, replace=False)
-        organ_sub = organ_pts[idx]
-    else:
-        organ_sub = organ_pts
+    sub_idx = gps_data.get('sub_idx')
+    if sub_idx is None:
+        if n_organ > target_pts:
+            sub_idx = np.random.RandomState(42).choice(
+                n_organ, target_pts, replace=False)
+        else:
+            sub_idx = np.arange(n_organ)
+        gps_data['sub_idx'] = sub_idx
+    organ_sub = organ_pts[sub_idx]
 
-    # Draw organ as semi-transparent scatter
-    ax.scatter(organ_sub[:, 0], organ_sub[:, 1], organ_sub[:, 2],
-               c='salmon', alpha=0.09, s=3, depthshade=True)
+    if coverage_counts is not None:
+        cov = coverage_counts[sub_idx].astype(np.float32)
+        # Normalize coverage on a soft scale so even a single hit shows color.
+        scale = max(float(np.percentile(cov[cov > 0], 75)) if (cov > 0).any()
+                    else 1.0, 1.0)
+        t = np.clip(cov / scale, 0.0, 1.0)
+        # Red (0) → Yellow (0.5) → Green (1.0)
+        colors = np.stack([
+            np.clip(1.0 - t, 0, 1),       # R
+            np.clip(t, 0, 1),              # G
+            np.zeros_like(t),              # B
+        ], axis=1)
+        # Missed points slightly more visible than covered ones
+        alphas = np.where(cov > 0, 0.18, 0.35)
+        ax.scatter(organ_sub[:, 0], organ_sub[:, 1], organ_sub[:, 2],
+                   c=colors, alpha=0.25, s=4, depthshade=True)
+        # Emphasize misses with an outline pass
+        miss = cov == 0
+        if miss.any():
+            ax.scatter(organ_sub[miss, 0], organ_sub[miss, 1], organ_sub[miss, 2],
+                       c='red', alpha=0.35, s=5, depthshade=True)
+    else:
+        ax.scatter(organ_sub[:, 0], organ_sub[:, 1], organ_sub[:, 2],
+                   c='salmon', alpha=0.09, s=3, depthshade=True)
     
     # Draw centerline as faded path
     n_cl = len(centerline)
@@ -272,7 +324,37 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
         }
     else:
         gps_data = None
-    
+
+    # ---- Precompute camera trajectory (positions + forwards) ----
+    cam_positions = np.zeros((n_frames, 3), dtype=np.float32)
+    cam_forwards = np.zeros((n_frames, 3), dtype=np.float32)
+    for i, view in enumerate(views):
+        cam_positions[i] = view.camera_center.detach().cpu().numpy()
+        w2c = view.world_view_transform.transpose(0, 1).detach().cpu().numpy()
+        c2w = np.linalg.inv(w2c)
+        f = c2w[:3, 2]
+        n = np.linalg.norm(f)
+        cam_forwards[i] = f / n if n > 1e-6 else np.array([0, 0, -1.0])
+
+    # Cumulative distance (mm) along the trajectory
+    seg_len = np.linalg.norm(np.diff(cam_positions, axis=0), axis=1)
+    cum_dist = np.concatenate([[0.0], np.cumsum(seg_len)])
+
+    # ---- Coverage setup (updated incrementally in the render loop) ----
+    if gps_data is not None:
+        organ_pts_f = gps_data['organ_pts'].astype(np.float32)
+        n_organ_pts = len(organ_pts_f)
+        cov_near = 1.0
+        cov_far = float(np.median(
+            np.linalg.norm(organ_pts_f - organ_pts_f.mean(0), axis=1)) * 3.0)
+        hfov_deg = 140.0  # matches prepare_c3vd default
+        print(f"\nCoverage tracking enabled "
+              f"(hfov={hfov_deg}°, near={cov_near:.1f}, far={cov_far:.1f})")
+        seen_any = np.zeros(n_organ_pts, dtype=bool)
+    else:
+        organ_pts_f = None
+        seen_any = None
+
     # ---- Layout: GPS is a big panel on the right; endo + depth stacked on the left ----
     view0 = views[0]
     H, W = int(view0.image_height), int(view0.image_width)
@@ -400,10 +482,21 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
                        (bar_x - 14, bar_top + bar_h_range + 14),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
+            # ---- Update running coverage with this frame's frustum ----
+            if seen_any is not None:
+                vis = frustum_visibility(
+                    cam_positions[idx], cam_forwards[idx], organ_pts_f,
+                    hfov_deg=hfov_deg, near=cov_near, far=cov_far,
+                )
+                seen_any |= vis
+
             # ---- GPS panel (big, on the right) ----
             if gps_data is not None:
+                current_cov = (seen_any.astype(np.int32)
+                               if seen_any is not None else None)
                 gps_img = render_gps_frame(
-                    gps_data, idx, width=gps_w, height=gps_h, dpi=110)
+                    gps_data, idx, coverage_counts=current_cov,
+                    width=gps_w, height=gps_h, dpi=110)
                 gps_bgr = cv2.cvtColor(gps_img, cv2.COLOR_RGB2BGR)
                 if gps_bgr.shape[1] != gps_w or gps_bgr.shape[0] != gps_h:
                     gps_bgr = cv2.resize(gps_bgr, (gps_w, gps_h))
@@ -413,6 +506,65 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
                 cv2.putText(gps_panel, "GPS: No organ model",
                            (gps_w // 4, gps_h // 2),
                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 100, 100), 2)
+
+            # ---- Stats overlay: withdrawal timer, speed, coverage ----
+            elapsed_s = idx / float(fps)
+            dist_mm = float(cum_dist[idx])
+            speed_mms = float(seg_len[idx - 1] * fps) if idx > 0 else 0.0
+            cov_pct = (float(seen_any.sum())
+                       / max(len(gps_data['organ_pts']), 1) * 100.0
+                       if seen_any is not None else 0.0)
+
+            # HUD strip at top of GPS panel
+            hud_h = 74
+            overlay = gps_panel.copy()
+            cv2.rectangle(overlay, (0, 0), (gps_w, hud_h), (12, 12, 18), -1)
+            cv2.addWeighted(overlay, 0.72, gps_panel, 0.28, 0, gps_panel)
+            # Guideline: withdrawal >= 6 min. Color speed if too fast.
+            good_speed = 1.0 <= speed_mms <= 6.0
+            speed_color = (80, 230, 120) if good_speed else (60, 120, 240)
+            time_color = (80, 230, 120) if elapsed_s >= 360 else (220, 220, 220)
+            cv2.putText(gps_panel, f"Withdrawal  {format_time_mmss(elapsed_s)}",
+                        (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.78,
+                        time_color, 2)
+            cv2.putText(gps_panel, "(target >= 06:00)",
+                        (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (140, 140, 150), 1)
+            cv2.putText(gps_panel, f"Speed  {speed_mms:5.1f} mm/s",
+                        (int(gps_w * 0.32), 32),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.78, speed_color, 2)
+            cv2.putText(gps_panel, f"Path  {dist_mm:6.1f} mm",
+                        (int(gps_w * 0.32), 58),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 210), 1)
+            cov_color = (80, 230, 120) if cov_pct >= 80 else \
+                        ((60, 200, 230) if cov_pct >= 50 else (60, 120, 240))
+            cv2.putText(gps_panel,
+                        f"Coverage  {cov_pct:5.1f}%",
+                        (int(gps_w * 0.62), 32),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.78, cov_color, 2)
+            # Coverage progress bar
+            bar_x1, bar_x2 = int(gps_w * 0.62), int(gps_w * 0.95)
+            bar_y = 52
+            cv2.rectangle(gps_panel, (bar_x1, bar_y),
+                          (bar_x2, bar_y + 10), (50, 50, 60), -1)
+            fill_x = int(bar_x1 + (bar_x2 - bar_x1) * cov_pct / 100.0)
+            cv2.rectangle(gps_panel, (bar_x1, bar_y),
+                          (fill_x, bar_y + 10), cov_color, -1)
+
+            # Legend for coverage colors (bottom of GPS panel)
+            leg_y = gps_h - 28
+            cv2.circle(gps_panel, (20, leg_y), 6, (60, 120, 240), -1)
+            cv2.putText(gps_panel, "missed",
+                        (32, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (200, 200, 210), 1)
+            cv2.circle(gps_panel, (110, leg_y), 6, (60, 230, 230), -1)
+            cv2.putText(gps_panel, "partial",
+                        (122, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (200, 200, 210), 1)
+            cv2.circle(gps_panel, (205, leg_y), 6, (80, 230, 120), -1)
+            cv2.putText(gps_panel, "well covered",
+                        (217, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (200, 200, 210), 1)
 
             # ---- Composite: [endo / depth] | [gps] ----
             canvas = np.zeros((vid_h, vid_w, 3), dtype=np.uint8)
