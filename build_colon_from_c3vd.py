@@ -29,41 +29,70 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prepare_c3vd import parse_c3vd_poses
 
 
+def _find_pairs(c3vd_dir):
+    """Locate matched (rgb, depth) file pairs across the layouts C3VD uses.
+
+    Two layouts have shipped:
+      A) <seq>/rgb/NNNN_color.png     +  <seq>/depth/NNNN_depth.png
+      B) <seq>/NNNN_color.png         +  <seq>/NNNN_depth.tiff   (flat)
+    """
+    # Layout A — separate rgb/ and depth/ subdirs
+    rgb_dirA = os.path.join(c3vd_dir, "rgb")
+    dep_dirA = os.path.join(c3vd_dir, "depth")
+    if os.path.isdir(rgb_dirA) and os.path.isdir(dep_dirA):
+        rgbs = sorted(glob.glob(os.path.join(rgb_dirA, "*_color.png")))
+        deps = sorted(glob.glob(os.path.join(dep_dirA, "*.png"))) \
+            or sorted(glob.glob(os.path.join(dep_dirA, "*.tiff")))
+        if rgbs and deps:
+            return list(zip(rgbs, deps))
+
+    # Layout B — flat dir with paired _color / _depth files (any extension)
+    rgbs = sorted(glob.glob(os.path.join(c3vd_dir, "*_color.png")))
+    if not rgbs:
+        rgbs = sorted(glob.glob(os.path.join(c3vd_dir, "*.png")))
+    if not rgbs:
+        return []
+    pairs = []
+    for r in rgbs:
+        stem = os.path.basename(r).split("_")[0]
+        for ext in ("tiff", "tif", "png"):
+            d = os.path.join(c3vd_dir, f"{stem}_depth.{ext}")
+            if os.path.exists(d):
+                pairs.append((r, d))
+                break
+    return pairs
+
+
 def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=120.0,
           hfov_deg=140.0, skip_every=1, max_frames=None):
     os.makedirs(output_dir, exist_ok=True)
 
     # ---- Load images, poses, GT depths ----
-    rgb_dir = os.path.join(c3vd_dir, "rgb")
-    if not os.path.isdir(rgb_dir):
-        rgb_dir = c3vd_dir
-    rgb_paths = sorted(glob.glob(os.path.join(rgb_dir, "*_color.png")))
-    if not rgb_paths:
-        rgb_paths = sorted(glob.glob(os.path.join(rgb_dir, "*.png")))
-    depth_paths = sorted(glob.glob(os.path.join(c3vd_dir, "depth", "*.png")))
-    pose_path = os.path.join(c3vd_dir, "pose.txt")
+    pairs = _find_pairs(c3vd_dir)
+    if not pairs:
+        sys.exit(f"ERROR: no RGB+depth pairs under {c3vd_dir}. "
+                 f"Expected NNNN_color.png + NNNN_depth.{{png,tiff}}.")
 
-    if not depth_paths:
-        sys.exit(f"ERROR: no depth PNGs under {c3vd_dir}/depth")
+    pose_path = os.path.join(c3vd_dir, "pose.txt")
     if not os.path.exists(pose_path):
         sys.exit(f"ERROR: missing {pose_path}")
 
-    poses = parse_c3vd_poses(pose_path)  # list of 4x4 c2w
-    n = min(len(rgb_paths), len(depth_paths), len(poses))
-    rgb_paths, depth_paths, poses = (
-        rgb_paths[:n], depth_paths[:n], poses[:n])
+    poses = parse_c3vd_poses(pose_path)
+    n = min(len(pairs), len(poses))
+    pairs = pairs[:n]
+    poses = poses[:n]
 
     if skip_every > 1:
         idx = list(range(0, n, skip_every))
-        rgb_paths = [rgb_paths[i] for i in idx]
-        depth_paths = [depth_paths[i] for i in idx]
+        pairs = [pairs[i] for i in idx]
         poses = [poses[i] for i in idx]
-    if max_frames and len(rgb_paths) > max_frames:
-        idx = np.linspace(0, len(rgb_paths)-1, max_frames, dtype=int)
-        rgb_paths = [rgb_paths[i] for i in idx]
-        depth_paths = [depth_paths[i] for i in idx]
+    if max_frames and len(pairs) > max_frames:
+        idx = np.linspace(0, len(pairs) - 1, max_frames, dtype=int)
+        pairs = [pairs[i] for i in idx]
         poses = [poses[i] for i in idx]
-    n = len(rgb_paths)
+    n = len(pairs)
+    rgb_paths = [p[0] for p in pairs]
+    depth_paths = [p[1] for p in pairs]
 
     sample = cv2.imread(rgb_paths[0])
     H, W = sample.shape[:2]
@@ -90,13 +119,21 @@ def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=120.0,
         if rgb.shape[:2] != (H, W):
             rgb = cv2.resize(rgb, (W, H))
 
-        dep16 = cv2.imread(dep_p, cv2.IMREAD_UNCHANGED)
-        if dep16 is None:
+        dep_raw = cv2.imread(dep_p, cv2.IMREAD_UNCHANGED)
+        if dep_raw is None:
             continue
-        if dep16.shape[:2] != (H, W):
-            dep16 = cv2.resize(dep16, (W, H), interpolation=cv2.INTER_NEAREST)
-        # C3VD: 16-bit linear, full range = 100 mm
-        depth_mm = dep16.astype(np.float32) * (100.0 / 65535.0)
+        if dep_raw.ndim == 3:
+            dep_raw = dep_raw[..., 0]
+        if dep_raw.shape[:2] != (H, W):
+            dep_raw = cv2.resize(dep_raw, (W, H),
+                                 interpolation=cv2.INTER_NEAREST)
+        # Two common C3VD encodings:
+        #   uint16 PNG/TIFF — 0..65535 linearly maps to 0..100 mm
+        #   float32 TIFF    — already in mm
+        if dep_raw.dtype == np.float32 or dep_raw.dtype == np.float64:
+            depth_mm = dep_raw.astype(np.float32)
+        else:
+            depth_mm = dep_raw.astype(np.float32) * (100.0 / 65535.0)
         depth_mm[depth_mm <= 0.5] = 0.0
         depth_mm[depth_mm >= depth_trunc] = 0.0
         if not np.any(depth_mm > 0):
