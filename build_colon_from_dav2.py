@@ -140,17 +140,49 @@ def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=120.0,
     )
     fused = 0
     depth_min = 0.5
-    for rgb_p, c2w in tqdm(list(zip(rgb_paths, poses)), desc="TSDF fuse (DAv2)"):
+    metric_scale_to_mm = 1000.0  # default: meters -> mm
+    first_logged = False
+    for f_idx, (rgb_p, c2w) in enumerate(
+            tqdm(list(zip(rgb_paths, poses)), desc="TSDF fuse (DAv2)")):
         rgb = cv2.cvtColor(cv2.imread(rgb_p), cv2.COLOR_BGR2RGB)
         if rgb.shape[:2] != (H, W):
             rgb = cv2.resize(rgb, (W, H))
         pred = dav2.predict(rgb)
         if dav2.is_metric:
-            depth_mm = pred * 1000.0  # meters -> mm
+            depth_mm = pred * metric_scale_to_mm
         else:
             depth_mm = disparity_to_depth(pred, a_avg, b_avg)
         depth_mm = depth_mm.astype(np.float32)
         depth_mm[~np.isfinite(depth_mm)] = 0.0
+
+        if not first_logged:
+            valid = depth_mm[depth_mm > 0]
+            pred_stats = (float(pred.min()), float(pred.max()),
+                          float(np.median(pred)))
+            dmm_stats = ((float(valid.min()), float(valid.max()),
+                          float(np.median(valid))) if valid.size else
+                         (0.0, 0.0, 0.0))
+            print(f"\n  First frame DAv2 pred:    "
+                  f"min={pred_stats[0]:.3f}, "
+                  f"max={pred_stats[1]:.3f}, "
+                  f"median={pred_stats[2]:.3f}")
+            print(f"  First frame depth (mm):  "
+                  f"min={dmm_stats[0]:.2f}, "
+                  f"max={dmm_stats[1]:.2f}, "
+                  f"median={dmm_stats[2]:.2f}")
+            # If metric output is clearly out of clipping range, auto-rescale
+            if dav2.is_metric and dmm_stats[1] > depth_trunc * 5:
+                ratio = (depth_trunc * 0.5) / max(dmm_stats[2], 1e-6)
+                metric_scale_to_mm *= ratio
+                depth_mm = (pred * metric_scale_to_mm).astype(np.float32)
+                depth_mm[~np.isfinite(depth_mm)] = 0.0
+                print(f"  WARNING: metric DAv2 output is way larger than "
+                      f"depth_trunc={depth_trunc} mm. Auto-rescaling: "
+                      f"new metric_scale = {metric_scale_to_mm:.4f} "
+                      f"(prefer --variant vitb with GT calibration for "
+                      f"quality).")
+            first_logged = True
+
         depth_mm[depth_mm <= depth_min] = 0.0
         depth_mm[depth_mm >= depth_trunc] = 0.0
         if not np.any(depth_mm > 0):
@@ -163,6 +195,14 @@ def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=120.0,
         w2c = np.linalg.inv(c2w).astype(np.float64)
         volume.integrate(rgbd, intrinsic, w2c)
         fused += 1
+
+    if fused == 0:
+        print("\nERROR: 0 frames were fused — every frame's depth was "
+              "outside [{}, {}] mm.".format(depth_min, depth_trunc))
+        print("  Most likely the DAv2 variant doesn't match the scene scale.")
+        print("  Re-run with: --variant vitb --calibration_frames 30  "
+              "(needs GT depth files alongside RGB).")
+        sys.exit(1)
 
     print(f"\nFused {fused}/{n} frames. Extracting mesh...")
     mesh = volume.extract_triangle_mesh()
