@@ -11,15 +11,12 @@ Usage:
 
 import os
 import sys
-import json
-import math
 import torch
 import numpy as np
 import cv2
 from tqdm import tqdm
 from argparse import ArgumentParser
 
-# Matplotlib for GPS rendering (headless-compatible)
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -64,25 +61,6 @@ def depth_to_colormap(depth_np, valid_mask=None, vmin=None, vmax=None,
     colored = cv2.applyColorMap(depth_u8, colormap)
     colored[~valid_mask] = 0
     return colored, vmin, vmax
-
-
-def auto_exposure(rgb_np, low_pct=1.0, high_pct=99.5, gamma=0.9):
-    """Percentile-based auto exposure so dark endoscope renders are visible.
-
-    Input/output: float32 (H, W, 3) expected in [0, 1+] range.
-    """
-    if rgb_np.size == 0:
-        return rgb_np
-    lum = rgb_np.max(axis=2)
-    lo = float(np.percentile(lum, low_pct))
-    hi = float(np.percentile(lum, high_pct))
-    if hi - lo < 1e-4:
-        hi = lo + 1e-4
-    out = (rgb_np - lo) / (hi - lo)
-    out = np.clip(out, 0, 1)
-    if gamma != 1.0:
-        out = np.power(out, gamma)
-    return out
 
 
 def frustum_visibility(cam_center, cam_forward, organ_pts,
@@ -147,7 +125,7 @@ def compute_organ_centerline(organ_mesh, n_points=100):
 
 
 def render_gps_frame(gps_data, current_idx, coverage_counts=None,
-                     reveal_mode=False,
+                     reveal_mode=False, cam_pos=None, cam_forward=None,
                      width=640, height=480, dpi=100):
     """
     Render a single GPS frame showing the organ + current camera dot.
@@ -225,35 +203,41 @@ def render_gps_frame(gps_data, current_idx, coverage_counts=None,
         ax.scatter(organ_sub[:, 0], organ_sub[:, 1], organ_sub[:, 2],
                    c='salmon', alpha=0.09, s=3, depthshade=True)
     
-    # Draw centerline as faded path
+    # Project the camera's actual position onto the centerline so the
+    # centerline-color split (traversed vs upcoming) reflects real motion,
+    # not just frame index.
     n_cl = len(centerline)
+    cur_pos = (np.asarray(cam_pos, dtype=np.float64)
+               if cam_pos is not None else None)
+    if cur_pos is not None and n_cl > 1:
+        d2 = np.sum((centerline - cur_pos[None, :]) ** 2, axis=1)
+        nearest_cl_idx = int(np.argmin(d2))
+    else:
+        # Fallback if no camera position is provided
+        nearest_cl_idx = min(int(current_idx / max(1, n_frames - 1)
+                                 * (n_cl - 1)), n_cl - 1)
+        cur_pos = centerline[nearest_cl_idx]
+
     if n_cl > 1:
         segments = []
         colors = []
         for i in range(n_cl - 1):
-            segments.append([centerline[i], centerline[i+1]])
-            # Progress along centerline
-            cl_idx = int(i / (n_cl - 1) * (n_frames - 1))
-            if cl_idx <= current_idx:
-                colors.append([0.2, 0.9, 0.2, 0.6])  # green = traversed
+            segments.append([centerline[i], centerline[i + 1]])
+            if i <= nearest_cl_idx:
+                colors.append([0.2, 0.9, 0.2, 0.6])     # traversed
             else:
-                colors.append([0.5, 0.5, 0.5, 0.2])   # gray = future
-        
-        lc = Line3DCollection(segments, colors=colors, linewidths=2.0)
-        ax.add_collection3d(lc)
-    
-    # Current position along centerline
-    t = current_idx / max(1, n_frames - 1)
-    cl_pos_idx = min(int(t * (n_cl - 1)), n_cl - 1)
-    cur_pos = centerline[cl_pos_idx]
+                colors.append([0.5, 0.5, 0.5, 0.2])     # upcoming
+        ax.add_collection3d(Line3DCollection(segments, colors=colors,
+                                             linewidths=2.0))
 
-    # Draw current position as bright large dot (scaled up for larger panel)
     ax.scatter(*cur_pos, c='lime', s=360, zorder=10, edgecolors='white',
                linewidths=2.5, depthshade=False)
 
-    # Start (green triangle) and end (red square)
-    ax.scatter(*centerline[0], c='green', s=160, marker='^', zorder=9, depthshade=False)
-    ax.scatter(*centerline[-1], c='red', s=160, marker='s', zorder=9, depthshade=False)
+    # Start (green triangle) and end (red square) of the GT centerline
+    ax.scatter(*centerline[0], c='green', s=160, marker='^', zorder=9,
+               depthshade=False)
+    ax.scatter(*centerline[-1], c='red', s=160, marker='s', zorder=9,
+               depthshade=False)
 
     # Viewpoint
     ax.view_init(elev=gps_data['elev'], azim=gps_data['azim'])
@@ -279,9 +263,10 @@ def render_gps_frame(gps_data, current_idx, coverage_counts=None,
     ax.zaxis.pane.set_edgecolor('none')
     ax.set_axis_off()
 
-    # Position text
-    pct = t * 100
-    ax.set_title(f"GPS  •  Frame {current_idx}/{n_frames-1}  •  {pct:.0f}% through organ",
+    # Title shows true progress along the centerline (camera-projected)
+    pct = (nearest_cl_idx / max(1, n_cl - 1)) * 100.0
+    ax.set_title(f"GPS  •  Frame {current_idx}/{n_frames-1}  •  "
+                 f"{pct:.0f}% along organ",
                  color='#58a6ff', fontsize=16, fontweight='bold', pad=6)
 
     fig.subplots_adjust(left=0.0, right=1.0, top=0.94, bottom=0.0)
@@ -624,6 +609,8 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
                 gps_img = render_gps_frame(
                     gps_data, idx, coverage_counts=current_cov,
                     reveal_mode=reveal_organ,
+                    cam_pos=cam_positions[idx],
+                    cam_forward=cam_forwards[idx],
                     width=gps_w, height=gps_h, dpi=80)
                 gps_bgr = cv2.cvtColor(gps_img, cv2.COLOR_RGB2BGR)
                 if gps_bgr.shape[1] != gps_w or gps_bgr.shape[0] != gps_h:

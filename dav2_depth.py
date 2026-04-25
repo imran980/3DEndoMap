@@ -18,7 +18,6 @@ Install once:
     pip install transformers accelerate
 """
 
-import os
 import numpy as np
 import torch
 from PIL import Image
