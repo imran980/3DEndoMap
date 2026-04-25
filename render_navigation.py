@@ -147,13 +147,18 @@ def compute_organ_centerline(organ_mesh, n_points=100):
 
 
 def render_gps_frame(gps_data, current_idx, coverage_counts=None,
+                     reveal_mode=False,
                      width=640, height=480, dpi=100):
     """
     Render a single GPS frame showing the organ + current camera dot.
     The dot position is interpolated along the organ's centerline.
 
-    If coverage_counts is provided, organ points are colored red (missed)
-    → yellow → green (well covered) based on how many frames saw them.
+    coverage_counts (N,) optional per-vertex visibility count.
+      - reveal_mode=False: organ points colored red (missed) → green
+        (covered) by the count.
+      - reveal_mode=True:  organ points are HIDDEN until the count > 0,
+        then drawn in tissue-pink. Gives a clean "shape painted in by
+        the moving camera" look against the pre-op mesh.
     """
     fig = plt.figure(figsize=(width/dpi, height/dpi), dpi=dpi)
     ax = fig.add_subplot(111, projection='3d')
@@ -182,25 +187,40 @@ def render_gps_frame(gps_data, current_idx, coverage_counts=None,
 
     if coverage_counts is not None:
         cov = coverage_counts[sub_idx].astype(np.float32)
-        # Normalize coverage on a soft scale so even a single hit shows color.
-        scale = max(float(np.percentile(cov[cov > 0], 75)) if (cov > 0).any()
-                    else 1.0, 1.0)
-        t = np.clip(cov / scale, 0.0, 1.0)
-        # Red (0) → Yellow (0.5) → Green (1.0)
-        colors = np.stack([
-            np.clip(1.0 - t, 0, 1),       # R
-            np.clip(t, 0, 1),              # G
-            np.zeros_like(t),              # B
-        ], axis=1)
-        # Missed points slightly more visible than covered ones
-        alphas = np.where(cov > 0, 0.18, 0.35)
-        ax.scatter(organ_sub[:, 0], organ_sub[:, 1], organ_sub[:, 2],
-                   c=colors, alpha=0.25, s=4, depthshade=True)
-        # Emphasize misses with an outline pass
-        miss = cov == 0
-        if miss.any():
-            ax.scatter(organ_sub[miss, 0], organ_sub[miss, 1], organ_sub[miss, 2],
-                       c='red', alpha=0.35, s=5, depthshade=True)
+        if reveal_mode:
+            # Only render the part of the organ the camera has actually seen.
+            seen = cov > 0
+            if seen.any():
+                pts = organ_sub[seen]
+                # Tissue-pink, slightly translucent so depth shading reads.
+                ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
+                           c='salmon', alpha=0.55, s=5, depthshade=True)
+            # Faint outline of the un-revealed mesh so the user has spatial
+            # context for the camera's location (very low alpha, easy to
+            # disable with --reveal_no_ghost).
+            unseen = ~seen
+            if unseen.any() and gps_data.get('reveal_show_ghost', True):
+                pts = organ_sub[unseen]
+                ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
+                           c=(0.4, 0.4, 0.45), alpha=0.04, s=2,
+                           depthshade=True)
+        else:
+            # Coverage heatmap: Red (0) → Yellow → Green (well-seen).
+            scale = max(float(np.percentile(cov[cov > 0], 75))
+                        if (cov > 0).any() else 1.0, 1.0)
+            t = np.clip(cov / scale, 0.0, 1.0)
+            colors = np.stack([
+                np.clip(1.0 - t, 0, 1),
+                np.clip(t, 0, 1),
+                np.zeros_like(t),
+            ], axis=1)
+            ax.scatter(organ_sub[:, 0], organ_sub[:, 1], organ_sub[:, 2],
+                       c=colors, alpha=0.25, s=4, depthshade=True)
+            miss = cov == 0
+            if miss.any():
+                ax.scatter(organ_sub[miss, 0], organ_sub[miss, 1],
+                           organ_sub[miss, 2], c='red', alpha=0.35, s=5,
+                           depthshade=True)
     else:
         ax.scatter(organ_sub[:, 0], organ_sub[:, 1], organ_sub[:, 2],
                    c='salmon', alpha=0.09, s=3, depthshade=True)
@@ -277,7 +297,7 @@ def render_gps_frame(gps_data, current_idx, coverage_counts=None,
 def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
                       output_name="navigation_dashboard",
                       dynamic_organ=False, voxel_size=0.5,
-                      mesh_update_every=15):
+                      mesh_update_every=15, reveal_organ=False):
     """Main rendering pipeline."""
     print("=" * 60)
     print("SURGICAL NAVIGATION DASHBOARD")
@@ -603,6 +623,7 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
                                if seen_any is not None else None)
                 gps_img = render_gps_frame(
                     gps_data, idx, coverage_counts=current_cov,
+                    reveal_mode=reveal_organ,
                     width=gps_w, height=gps_h, dpi=80)
                 gps_bgr = cv2.cvtColor(gps_img, cv2.COLOR_RGB2BGR)
                 if gps_bgr.shape[1] != gps_w or gps_bgr.shape[0] != gps_h:
@@ -660,6 +681,21 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
                             (int(gps_w * 0.62), 58),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                             (160, 160, 170), 1)
+            elif reveal_organ:
+                rev_color = (80, 230, 120) if cov_pct >= 80 else \
+                            ((60, 200, 230) if cov_pct >= 50
+                             else (60, 120, 240))
+                cv2.putText(gps_panel,
+                            f"Revealed  {cov_pct:5.1f}%",
+                            (int(gps_w * 0.62), 32),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.78, rev_color, 2)
+                bar_x1, bar_x2 = int(gps_w * 0.62), int(gps_w * 0.95)
+                bar_y = 52
+                cv2.rectangle(gps_panel, (bar_x1, bar_y),
+                              (bar_x2, bar_y + 10), (50, 50, 60), -1)
+                fill_x = int(bar_x1 + (bar_x2 - bar_x1) * cov_pct / 100.0)
+                cv2.rectangle(gps_panel, (bar_x1, bar_y),
+                              (fill_x, bar_y + 10), rev_color, -1)
             else:
                 cov_color = (80, 230, 120) if cov_pct >= 80 else \
                             ((60, 200, 230) if cov_pct >= 50
@@ -683,6 +719,12 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
                             "Organ surface built live from per-frame depth "
                             "fusion (TSDF, voxel "
                             f"{organ_builder.voxel_size:.2f} mm)",
+                            (14, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, (180, 180, 190), 1)
+            elif reveal_organ:
+                cv2.putText(gps_panel,
+                            "Pre-op organ mesh painted in by camera frustum "
+                            "(only inspected anatomy is shown)",
                             (14, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX,
                             0.45, (180, 180, 190), 1)
             else:
@@ -752,12 +794,22 @@ if __name__ == "__main__":
     parser.add_argument("--dynamic_organ", action="store_true",
                         help="Build organ mesh live via per-frame TSDF fusion "
                              "instead of using a pre-op static mesh")
+    parser.add_argument("--reveal_organ", action="store_true",
+                        help="Use the pre-op organ mesh but only show the "
+                             "vertices the camera has actually seen "
+                             "(grows with the camera). Mutually exclusive "
+                             "with --dynamic_organ.")
     parser.add_argument("--voxel_size", default=0.5, type=float,
                         help="TSDF voxel size in mm (dynamic_organ only)")
     parser.add_argument("--mesh_update_every", default=15, type=int,
                         help="Extract mesh every N frames (dynamic_organ only)")
 
     args = get_combined_args(parser)
+
+    if args.dynamic_organ and args.reveal_organ:
+        sys.exit("ERROR: pass at most one of --dynamic_organ or "
+                 "--reveal_organ (they answer the same question with "
+                 "different sources for the GPS panel).")
 
     if args.configs:
         import mmcv
@@ -776,4 +828,5 @@ if __name__ == "__main__":
         dynamic_organ=args.dynamic_organ,
         voxel_size=args.voxel_size,
         mesh_update_every=args.mesh_update_every,
+        reveal_organ=args.reveal_organ,
     )
