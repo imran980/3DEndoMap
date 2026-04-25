@@ -63,8 +63,27 @@ def _find_pairs(c3vd_dir):
     return pairs
 
 
+def _pose_to_organ_space(c2w):
+    """Map a C3VD pose-space c2w into the organ-mesh coordinate frame.
+
+    Empirically determined by ICP sweep against trans_model.obj on
+    trans_t1_b: the GT phantom mesh is Z-up while pose.txt is Y-up
+    with a Z-flip; the equivalent rotation maps (x,y,z) -> (x,-z,-y).
+    Same matrix is also applied (left-multiplied) to each frame's c2w
+    so the fused TSDF mesh lands in organ coordinates directly.
+    """
+    M = np.array([
+        [1, 0, 0, 0],
+        [0, 0, -1, 0],
+        [0, -1, 0, 0],
+        [0, 0, 0, 1],
+    ], dtype=np.float64)
+    return M @ c2w
+
+
 def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=120.0,
-          hfov_deg=140.0, skip_every=1, max_frames=None):
+          hfov_deg=140.0, skip_every=1, max_frames=None,
+          align_to_organ=True):
     os.makedirs(output_dir, exist_ok=True)
 
     # ---- Load images, poses, GT depths ----
@@ -78,6 +97,8 @@ def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=120.0,
         sys.exit(f"ERROR: missing {pose_path}")
 
     poses = parse_c3vd_poses(pose_path)
+    if align_to_organ:
+        poses = [_pose_to_organ_space(p) for p in poses]
     n = min(len(pairs), len(poses))
     pairs = pairs[:n]
     poses = poses[:n]
@@ -190,7 +211,10 @@ if __name__ == "__main__":
                    help="Horizontal FOV (deg) — match prepare_c3vd")
     p.add_argument("--skip_every", default=1, type=int)
     p.add_argument("--max_frames", default=None, type=int)
+    p.add_argument("--no_align_to_organ", action="store_true",
+                   help="Skip the pose->organ rotation (default: applied)")
     a = p.parse_args()
     build(a.c3vd_dir, a.output_dir,
           voxel_size=a.voxel_size, depth_trunc=a.depth_trunc,
-          hfov_deg=a.hfov, skip_every=a.skip_every, max_frames=a.max_frames)
+          hfov_deg=a.hfov, skip_every=a.skip_every, max_frames=a.max_frames,
+          align_to_organ=not a.no_align_to_organ)
