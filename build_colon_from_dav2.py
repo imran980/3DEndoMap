@@ -55,10 +55,11 @@ def _read_c3vd_depth_mm(path, target_hw=None):
     return raw.astype(np.float32) * (100.0 / 65535.0)
 
 
-def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=120.0,
+def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=80.0,
           hfov_deg=140.0, variant="metric_indoor_b",
           skip_every=1, max_frames=None, align_to_organ=True,
-          calibration_frames=20):
+          calibration_frames=20, per_frame_calib=True,
+          min_disparity_pct=10.0, depth_smooth_ksize=5):
     os.makedirs(output_dir, exist_ok=True)
 
     pairs_with_gt = _find_pairs(c3vd_dir)
@@ -139,21 +140,49 @@ def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=120.0,
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
     )
     fused = 0
+    n_per_frame_calib = 0
     depth_min = 0.5
-    metric_scale_to_mm = 1000.0  # default: meters -> mm
+    metric_scale_to_mm = 1000.0
     first_logged = False
+
+    use_per_frame = (per_frame_calib and not dav2.is_metric
+                     and any(p for p in gt_depth_paths))
+    if use_per_frame:
+        print(f"Per-frame calibration enabled (GT-paired frames will fit "
+              f"their own a, b; rest fall back to global a={a_avg:.2f}, "
+              f"b={b_avg:.2f}).")
+
     for f_idx, (rgb_p, c2w) in enumerate(
             tqdm(list(zip(rgb_paths, poses)), desc="TSDF fuse (DAv2)")):
         rgb = cv2.cvtColor(cv2.imread(rgb_p), cv2.COLOR_BGR2RGB)
         if rgb.shape[:2] != (H, W):
             rgb = cv2.resize(rgb, (W, H))
         pred = dav2.predict(rgb)
+
+        # Reject the noisiest (lowest disparity = farthest) pixels per frame
+        if not dav2.is_metric and min_disparity_pct > 0:
+            cutoff = float(np.percentile(pred, min_disparity_pct))
+            valid_pred = pred > cutoff
+        else:
+            valid_pred = pred > 0
+
         if dav2.is_metric:
             depth_mm = pred * metric_scale_to_mm
         else:
-            depth_mm = disparity_to_depth(pred, a_avg, b_avg)
+            a_use, b_use = a_avg, b_avg
+            if use_per_frame and gt_depth_paths[f_idx]:
+                gt_mm = _read_c3vd_depth_mm(gt_depth_paths[f_idx],
+                                            target_hw=(H, W))
+                if gt_mm is not None:
+                    a_pf, b_pf = fit_disparity_to_depth(pred, gt_mm)
+                    if a_pf is not None:
+                        a_use, b_use = a_pf, b_pf
+                        n_per_frame_calib += 1
+            depth_mm = disparity_to_depth(pred, a_use, b_use)
+
         depth_mm = depth_mm.astype(np.float32)
         depth_mm[~np.isfinite(depth_mm)] = 0.0
+        depth_mm[~valid_pred] = 0.0
 
         if not first_logged:
             valid = depth_mm[depth_mm > 0]
@@ -170,12 +199,12 @@ def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=120.0,
                   f"min={dmm_stats[0]:.2f}, "
                   f"max={dmm_stats[1]:.2f}, "
                   f"median={dmm_stats[2]:.2f}")
-            # If metric output is clearly out of clipping range, auto-rescale
             if dav2.is_metric and dmm_stats[1] > depth_trunc * 5:
                 ratio = (depth_trunc * 0.5) / max(dmm_stats[2], 1e-6)
                 metric_scale_to_mm *= ratio
                 depth_mm = (pred * metric_scale_to_mm).astype(np.float32)
                 depth_mm[~np.isfinite(depth_mm)] = 0.0
+                depth_mm[~valid_pred] = 0.0
                 print(f"  WARNING: metric DAv2 output is way larger than "
                       f"depth_trunc={depth_trunc} mm. Auto-rescaling: "
                       f"new metric_scale = {metric_scale_to_mm:.4f} "
@@ -185,6 +214,11 @@ def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=120.0,
 
         depth_mm[depth_mm <= depth_min] = 0.0
         depth_mm[depth_mm >= depth_trunc] = 0.0
+
+        # Median filter to kill spike outliers before fusion
+        if depth_smooth_ksize and depth_smooth_ksize >= 3:
+            depth_mm = cv2.medianBlur(depth_mm, depth_smooth_ksize)
+
         if not np.any(depth_mm > 0):
             continue
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
@@ -203,6 +237,8 @@ def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=120.0,
         print("  Re-run with: --variant vitb --calibration_frames 30  "
               "(needs GT depth files alongside RGB).")
         sys.exit(1)
+
+    print(f"  Per-frame calibrations applied: {n_per_frame_calib}/{fused}")
 
     print(f"\nFused {fused}/{n} frames. Extracting mesh...")
     mesh = volume.extract_triangle_mesh()
@@ -243,16 +279,31 @@ if __name__ == "__main__":
                    help="DAv2 variant. metric_* outputs meters directly; "
                         "vits/b/l are relative and need GT for calibration.")
     p.add_argument("--voxel_size", default=0.5, type=float)
-    p.add_argument("--depth_trunc", default=120.0, type=float)
+    p.add_argument("--depth_trunc", default=80.0, type=float,
+                   help="Reject depths beyond this in mm. Default 80 — "
+                        "tight enough to drop DAv2's far-field outliers but "
+                        "still cover the inside of a colon segment.")
     p.add_argument("--hfov", default=140.0, type=float)
     p.add_argument("--skip_every", default=1, type=int)
     p.add_argument("--max_frames", default=None, type=int)
     p.add_argument("--no_align_to_organ", action="store_true")
     p.add_argument("--calibration_frames", default=20, type=int)
+    p.add_argument("--no_per_frame_calib", action="store_true",
+                   help="Disable per-frame (a, b) refit on GT-paired frames "
+                        "(default: enabled when GT is available)")
+    p.add_argument("--min_disparity_pct", default=10.0, type=float,
+                   help="Drop the lowest N%% of disparity per frame "
+                        "(noisiest = farthest pixels). Set 0 to keep all.")
+    p.add_argument("--depth_smooth_ksize", default=5, type=int,
+                   help="Median-filter kernel applied to depth_mm before "
+                        "TSDF fusion (kills spike outliers). 0 = off.")
     a = p.parse_args()
     build(a.c3vd_dir, a.output_dir,
           voxel_size=a.voxel_size, depth_trunc=a.depth_trunc,
           hfov_deg=a.hfov, variant=a.variant,
           skip_every=a.skip_every, max_frames=a.max_frames,
           align_to_organ=not a.no_align_to_organ,
-          calibration_frames=a.calibration_frames)
+          calibration_frames=a.calibration_frames,
+          per_frame_calib=not a.no_per_frame_calib,
+          min_disparity_pct=a.min_disparity_pct,
+          depth_smooth_ksize=a.depth_smooth_ksize)
