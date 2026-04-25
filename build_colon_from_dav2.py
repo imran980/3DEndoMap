@@ -1,26 +1,39 @@
 """
-Build a colon mesh from RGB + camera poses using Depth-Anything-V2 for
-per-frame depth — *no* trained Endo-4DGS required.
+Build a colon mesh from RGB + camera poses using a learned monocular
+depth backbone — *no* trained Endo-4DGS required.
 
-Two depth modes:
+Two backbones are wired in:
 
-  --variant metric_indoor_b   uses the metric DAv2 (output is meters,
-                              we convert to mm). Works on any sequence,
-                              quality depends on indoor-trained prior
-                              transferring to colonoscopy.
+  --backbone dav2  (default)
+      Depth-Anything-V2 via HuggingFace. Variants:
+        vits / vitb / vitl                — relative (disparity) output,
+                                            needs GT depth to calibrate.
+        metric_indoor_s/b/l               — outputs meters directly.
 
-  --variant vitb              uses relative DAv2 (disparity output) and
-                              fits scale per-frame against C3VD GT depth
-                              if --calib_dir is given. Highest quality
-                              when GT is available.
+  --backbone endodac
+      EndoDAC (MICCAI 2024) — endoscopy-finetuned DepthAnything. Best
+      quality on real colonoscopy. Not pip-installable; clone the repo
+      and pass --endodac_repo + --endodac_weights:
+        git clone https://github.com/BeileiCui/EndoDAC external/EndoDAC
+        # follow their README to fetch endodac.pth
 
-For non-C3VD data, pass --variant metric_indoor_b.
+Per-frame linear calibration `depth = a / pred + b` is fit against C3VD
+GT depth on a subset of frames (and re-fit per frame when GT is
+present), with far-pixel rejection and a median-filter pass to keep
+TSDF clean.
 
 Usage:
     python build_colon_from_dav2.py \
         --c3vd_dir dataset/trans_t1_b \
         --output_dir output/colon_dav2_trans \
-        --variant metric_indoor_b
+        --backbone dav2 --variant vitb --calibration_frames 30
+
+    python build_colon_from_dav2.py \
+        --c3vd_dir dataset/trans_t1_b \
+        --output_dir output/colon_endodac_trans \
+        --backbone endodac \
+        --endodac_repo external/EndoDAC \
+        --endodac_weights external/EndoDAC/checkpoints/endodac.pth
 """
 
 import os
@@ -37,7 +50,8 @@ from argparse import ArgumentParser
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prepare_c3vd import parse_c3vd_poses
 from build_colon_from_c3vd import _find_pairs, _pose_to_organ_space
-from dav2_depth import DepthAnythingV2, fit_disparity_to_depth, disparity_to_depth
+from dav2_depth import fit_disparity_to_depth, disparity_to_depth
+from depth_backbones import make_backbone
 
 
 def _read_c3vd_depth_mm(path, target_hw=None):
@@ -56,7 +70,8 @@ def _read_c3vd_depth_mm(path, target_hw=None):
 
 
 def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=80.0,
-          hfov_deg=140.0, variant="metric_indoor_b",
+          hfov_deg=140.0, backbone="dav2", variant="metric_indoor_b",
+          endodac_repo=None, endodac_weights=None,
           skip_every=1, max_frames=None, align_to_organ=True,
           calibration_frames=20, per_frame_calib=True,
           min_disparity_pct=10.0, depth_smooth_ksize=5):
@@ -102,11 +117,21 @@ def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=80.0,
         W, H, fx, fy, W / 2.0, H / 2.0)
 
     print(f"Frames: {n}  Image: {W}x{H}  hFOV: {hfov_deg}°  "
-          f"variant: {variant}")
+          f"backbone: {backbone}"
+          + (f"/{variant}" if backbone == "dav2" else ""))
     print(f"TSDF voxel: {voxel_size} mm  depth_trunc: {depth_trunc} mm")
 
-    print("Loading Depth-Anything-V2...")
-    dav2 = DepthAnythingV2(variant=variant)
+    print(f"Loading depth backbone ({backbone})...")
+    if backbone == "dav2":
+        dav2 = make_backbone("dav2", variant=variant)
+    elif backbone == "endodac":
+        if not endodac_repo or not endodac_weights:
+            sys.exit("ERROR: --backbone endodac requires --endodac_repo "
+                     "and --endodac_weights.")
+        dav2 = make_backbone("endodac", repo_dir=endodac_repo,
+                             weights_path=endodac_weights)
+    else:
+        sys.exit(f"Unknown backbone: {backbone}")
 
     # --- Calibration (only needed for relative-depth variants) ---
     a_avg, b_avg = None, None
@@ -272,12 +297,24 @@ if __name__ == "__main__":
     p = ArgumentParser(description="Fuse RGB + DAv2 depth + poses into a mesh")
     p.add_argument("--c3vd_dir", required=True)
     p.add_argument("--output_dir", required=True)
-    p.add_argument("--variant", default="metric_indoor_b",
+    p.add_argument("--backbone", default="dav2",
+                   choices=["dav2", "endodac"],
+                   help="Per-frame depth model. 'dav2' = HuggingFace "
+                        "Depth-Anything-V2 (default). 'endodac' = "
+                        "endoscopy-finetuned EndoDAC (clone the repo + "
+                        "pass --endodac_repo / --endodac_weights).")
+    p.add_argument("--variant", default="vitb",
                    choices=["vits", "vitb", "vitl",
                             "metric_indoor_s", "metric_indoor_b",
                             "metric_indoor_l"],
-                   help="DAv2 variant. metric_* outputs meters directly; "
-                        "vits/b/l are relative and need GT for calibration.")
+                   help="DAv2 variant (only used when --backbone dav2). "
+                        "metric_* outputs meters directly; vits/b/l are "
+                        "relative and need GT for calibration.")
+    p.add_argument("--endodac_repo", default=None,
+                   help="Path to a local clone of "
+                        "https://github.com/BeileiCui/EndoDAC")
+    p.add_argument("--endodac_weights", default=None,
+                   help="Path to EndoDAC checkpoint (.pth)")
     p.add_argument("--voxel_size", default=0.5, type=float)
     p.add_argument("--depth_trunc", default=80.0, type=float,
                    help="Reject depths beyond this in mm. Default 80 — "
@@ -300,7 +337,9 @@ if __name__ == "__main__":
     a = p.parse_args()
     build(a.c3vd_dir, a.output_dir,
           voxel_size=a.voxel_size, depth_trunc=a.depth_trunc,
-          hfov_deg=a.hfov, variant=a.variant,
+          hfov_deg=a.hfov,
+          backbone=a.backbone, variant=a.variant,
+          endodac_repo=a.endodac_repo, endodac_weights=a.endodac_weights,
           skip_every=a.skip_every, max_frames=a.max_frames,
           align_to_organ=not a.no_align_to_organ,
           calibration_frames=a.calibration_frames,
