@@ -1,8 +1,14 @@
 """
-Surgical Navigation Dashboard — Render a synchronized video showing:
-  - Panel 1: Endoscopic RGB view (from inside the organ)
-  - Panel 2: Depth colormap
-  - Panel 3: GPS view (organ wireframe + current camera position)
+Surgical Navigation Dashboard — Endo-4DGS edition.
+
+Renders a per-frame video composite from a TRAINED Endo-4DGS model:
+  - Panel 1: endoscopic RGB rendered from the Gaussians
+  - Panel 2: depth colormap (from the same render)
+  - Panel 3: 3D GPS view (static / dynamic-TSDF / reveal modes)
+
+If you don't have a converged Endo-4DGS model, use
+render_navigation_c3vd.py instead — it works directly off RGB + poses
+plus a learned depth backbone (EndoDAC / DAv2).
 
 Usage:
     python render_navigation.py --model_path output/endonerf/c3vd_trans \
@@ -17,11 +23,6 @@ import cv2
 from tqdm import tqdm
 from argparse import ArgumentParser
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Line3DCollection
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from arguments import ModelParams, PipelineParams, ModelHiddenParams, get_combined_args
@@ -30,253 +31,12 @@ from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 from utils.graphics_utils import fov2focal
 from dynamic_organ import DynamicOrganBuilder
+from dashboard_common import (
+    depth_to_colormap, frustum_visibility, format_time_mmss,
+    compute_organ_centerline, render_gps_frame,
+)
 
 import open3d as o3d
-
-
-def depth_to_colormap(depth_np, valid_mask=None, vmin=None, vmax=None,
-                      colormap=cv2.COLORMAP_TURBO):
-    """Convert a depth map to a colored visualization.
-
-    Uses per-frame percentile normalization over valid pixels so each frame
-    shows a real near→far gradient instead of shifting globally.
-    """
-    if valid_mask is None:
-        valid_mask = depth_np > 0
-
-    valid = depth_np[valid_mask]
-    if valid.size < 16:
-        return np.zeros((*depth_np.shape, 3), dtype=np.uint8)
-
-    if vmin is None:
-        vmin = float(np.percentile(valid, 5))
-    if vmax is None:
-        vmax = float(np.percentile(valid, 95))
-    if vmax - vmin < 1e-4:
-        vmax = vmin + 1e-4
-
-    depth_norm = np.clip((depth_np - vmin) / (vmax - vmin), 0, 1)
-    # Invert so near = red/warm, far = blue/cool (more intuitive for endoscopy)
-    depth_u8 = ((1.0 - depth_norm) * 255).astype(np.uint8)
-    colored = cv2.applyColorMap(depth_u8, colormap)
-    colored[~valid_mask] = 0
-    return colored, vmin, vmax
-
-
-def frustum_visibility(cam_center, cam_forward, organ_pts,
-                       hfov_deg=140.0, near=1.0, far=120.0):
-    """Return a boolean array (N,) marking organ points inside this camera's
-    view frustum. Cheap cone-based approximation (no occlusion): a point is
-    "seen" if within hfov/2 of forward and between [near, far] along the ray.
-    """
-    d = organ_pts - cam_center[None, :]
-    dist = np.linalg.norm(d, axis=1)
-    safe = dist > 1e-6
-    d_norm = np.zeros_like(d)
-    d_norm[safe] = d[safe] / dist[safe, None]
-    cos_sim = d_norm @ cam_forward
-    cos_half = float(np.cos(np.radians(hfov_deg) / 2.0))
-    return safe & (cos_sim > cos_half) & (dist >= near) & (dist <= far)
-
-
-def format_time_mmss(seconds):
-    m = int(seconds // 60)
-    s = int(seconds % 60)
-    return f"{m:02d}:{s:02d}"
-
-
-def compute_organ_centerline(organ_mesh, n_points=100):
-    """
-    Compute a smooth centerline path through the organ using PCA
-    to find the principal axis, then project organ vertices onto it
-    and interpolate along the path.
-    """
-    pts = np.asarray(organ_mesh.vertices)
-    center = pts.mean(axis=0)
-    
-    # PCA to find principal axis
-    centered = pts - center
-    cov = np.cov(centered.T)
-    eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    
-    # Principal axis = eigenvector with largest eigenvalue
-    principal = eigenvectors[:, -1]
-    
-    # Project all points onto principal axis
-    projections = centered @ principal
-    
-    # Create centerline along principal axis
-    pmin, pmax = projections.min(), projections.max()
-    t_values = np.linspace(pmin, pmax, n_points)
-    
-    # For each t, find the centroid of nearby points
-    centerline = []
-    bin_width = (pmax - pmin) / n_points * 2
-    for t in t_values:
-        mask = np.abs(projections - t) < bin_width
-        if mask.sum() > 0:
-            local_center = pts[mask].mean(axis=0)
-            centerline.append(local_center)
-        else:
-            # Fallback: linear interpolation
-            centerline.append(center + principal * t)
-    
-    return np.array(centerline)
-
-
-def render_gps_frame(gps_data, current_idx, coverage_counts=None,
-                     reveal_mode=False, cam_pos=None, cam_forward=None,
-                     width=640, height=480, dpi=100):
-    """
-    Render a single GPS frame showing the organ + current camera dot.
-    The dot position is interpolated along the organ's centerline.
-
-    coverage_counts (N,) optional per-vertex visibility count.
-      - reveal_mode=False: organ points colored red (missed) → green
-        (covered) by the count.
-      - reveal_mode=True:  organ points are HIDDEN until the count > 0,
-        then drawn in tissue-pink. Gives a clean "shape painted in by
-        the moving camera" look against the pre-op mesh.
-    """
-    fig = plt.figure(figsize=(width/dpi, height/dpi), dpi=dpi)
-    ax = fig.add_subplot(111, projection='3d')
-
-    organ_pts = gps_data['organ_pts']
-    centerline = gps_data['centerline']
-    center = gps_data['center']
-    extent = gps_data['extent']
-    n_frames = gps_data['n_frames']
-
-    # Stable subsample — reuse same indices across frames so coverage colors
-    # stay consistent point-for-point throughout the video. Capped at 6000
-    # because matplotlib 3D scatter is O(N) per frame and 18k points on a
-    # 1200x900 panel is the dominant render cost.
-    n_organ = len(organ_pts)
-    target_pts = 6000
-    sub_idx = gps_data.get('sub_idx')
-    if sub_idx is None or len(sub_idx) > n_organ:
-        if n_organ > target_pts:
-            sub_idx = np.random.RandomState(42).choice(
-                n_organ, target_pts, replace=False)
-        else:
-            sub_idx = np.arange(n_organ)
-        gps_data['sub_idx'] = sub_idx
-    organ_sub = organ_pts[sub_idx]
-
-    if coverage_counts is not None:
-        cov = coverage_counts[sub_idx].astype(np.float32)
-        if reveal_mode:
-            # Only render the part of the organ the camera has actually seen.
-            seen = cov > 0
-            if seen.any():
-                pts = organ_sub[seen]
-                # Tissue-pink, slightly translucent so depth shading reads.
-                ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
-                           c='salmon', alpha=0.55, s=5, depthshade=True)
-            # Faint outline of the un-revealed mesh so the user has spatial
-            # context for the camera's location (very low alpha, easy to
-            # disable with --reveal_no_ghost).
-            unseen = ~seen
-            if unseen.any() and gps_data.get('reveal_show_ghost', True):
-                pts = organ_sub[unseen]
-                ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
-                           c=(0.4, 0.4, 0.45), alpha=0.04, s=2,
-                           depthshade=True)
-        else:
-            # Coverage heatmap: Red (0) → Yellow → Green (well-seen).
-            scale = max(float(np.percentile(cov[cov > 0], 75))
-                        if (cov > 0).any() else 1.0, 1.0)
-            t = np.clip(cov / scale, 0.0, 1.0)
-            colors = np.stack([
-                np.clip(1.0 - t, 0, 1),
-                np.clip(t, 0, 1),
-                np.zeros_like(t),
-            ], axis=1)
-            ax.scatter(organ_sub[:, 0], organ_sub[:, 1], organ_sub[:, 2],
-                       c=colors, alpha=0.25, s=4, depthshade=True)
-            miss = cov == 0
-            if miss.any():
-                ax.scatter(organ_sub[miss, 0], organ_sub[miss, 1],
-                           organ_sub[miss, 2], c='red', alpha=0.35, s=5,
-                           depthshade=True)
-    else:
-        ax.scatter(organ_sub[:, 0], organ_sub[:, 1], organ_sub[:, 2],
-                   c='salmon', alpha=0.09, s=3, depthshade=True)
-    
-    # Project the camera's actual position onto the centerline so the
-    # centerline-color split (traversed vs upcoming) reflects real motion,
-    # not just frame index.
-    n_cl = len(centerline)
-    cur_pos = (np.asarray(cam_pos, dtype=np.float64)
-               if cam_pos is not None else None)
-    if cur_pos is not None and n_cl > 1:
-        d2 = np.sum((centerline - cur_pos[None, :]) ** 2, axis=1)
-        nearest_cl_idx = int(np.argmin(d2))
-    else:
-        # Fallback if no camera position is provided
-        nearest_cl_idx = min(int(current_idx / max(1, n_frames - 1)
-                                 * (n_cl - 1)), n_cl - 1)
-        cur_pos = centerline[nearest_cl_idx]
-
-    if n_cl > 1:
-        segments = []
-        colors = []
-        for i in range(n_cl - 1):
-            segments.append([centerline[i], centerline[i + 1]])
-            if i <= nearest_cl_idx:
-                colors.append([0.2, 0.9, 0.2, 0.6])     # traversed
-            else:
-                colors.append([0.5, 0.5, 0.5, 0.2])     # upcoming
-        ax.add_collection3d(Line3DCollection(segments, colors=colors,
-                                             linewidths=2.0))
-
-    ax.scatter(*cur_pos, c='lime', s=360, zorder=10, edgecolors='white',
-               linewidths=2.5, depthshade=False)
-
-    # Start (green triangle) and end (red square) of the GT centerline
-    ax.scatter(*centerline[0], c='green', s=160, marker='^', zorder=9,
-               depthshade=False)
-    ax.scatter(*centerline[-1], c='red', s=160, marker='s', zorder=9,
-               depthshade=False)
-
-    # Viewpoint
-    ax.view_init(elev=gps_data['elev'], azim=gps_data['azim'])
-
-    # Axis limits — tight around organ
-    max_range = extent.max() * 0.6
-    ax.set_xlim(center[0] - max_range, center[0] + max_range)
-    ax.set_ylim(center[1] - max_range, center[1] + max_range)
-    ax.set_zlim(center[2] - max_range, center[2] + max_range)
-    try:
-        ax.set_box_aspect((1, 1, 1))
-    except Exception:
-        pass
-
-    # Styling
-    ax.set_facecolor('#0d1117')
-    fig.patch.set_facecolor('#0d1117')
-    ax.xaxis.pane.fill = False
-    ax.yaxis.pane.fill = False
-    ax.zaxis.pane.fill = False
-    ax.xaxis.pane.set_edgecolor('none')
-    ax.yaxis.pane.set_edgecolor('none')
-    ax.zaxis.pane.set_edgecolor('none')
-    ax.set_axis_off()
-
-    # Title shows true progress along the centerline (camera-projected)
-    pct = (nearest_cl_idx / max(1, n_cl - 1)) * 100.0
-    ax.set_title(f"GPS  •  Frame {current_idx}/{n_frames-1}  •  "
-                 f"{pct:.0f}% along organ",
-                 color='#58a6ff', fontsize=16, fontweight='bold', pad=6)
-
-    fig.subplots_adjust(left=0.0, right=1.0, top=0.94, bottom=0.0)
-    
-    fig.canvas.draw()
-    w, h = fig.canvas.get_width_height()
-    buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
-    plt.close(fig)
-    
-    return buf
 
 
 def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,

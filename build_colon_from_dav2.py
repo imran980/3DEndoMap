@@ -70,7 +70,7 @@ def _read_c3vd_depth_mm(path, target_hw=None):
 
 
 def build(c3vd_dir, output_dir, voxel_size=0.5, depth_trunc=80.0,
-          hfov_deg=140.0, backbone="dav2", variant="metric_indoor_b",
+          hfov_deg=140.0, backbone="dav2", variant="vitb",
           endodac_repo=None, endodac_weights=None,
           skip_every=1, max_frames=None, align_to_organ=True,
           calibration_frames=20, per_frame_calib=True,
