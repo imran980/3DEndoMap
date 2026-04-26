@@ -119,10 +119,14 @@ class EndoDACBackbone(DepthBackbone):
                 f"Did you copy the EndoDAC source into the repo dir? "
                 f"Expected path: {self.repo_dir}/models/endodac/endodac.py\n  {e}")
 
-        # The released checkpoint stores its training resolution
+        # The released checkpoint may stash a training resolution under
+        # state['height']/['width'], but it isn't always a multiple of the
+        # DINOv2 patch size (14) — and EndoDAC's own test_simple.py
+        # hardcodes image_shape=(224, 280), so we follow that convention
+        # for both model construction and the input resize. Override at
+        # call sites if needed.
         state = torch.load(depth_model_path, map_location=self.device)
-        feed_h = int(state.get("height", 224))
-        feed_w = int(state.get("width", 280))
+        feed_h, feed_w = 224, 280
         self.feed_size = (feed_h, feed_w)
 
         self.model = endodac_mod.endodac(
@@ -136,11 +140,16 @@ class EndoDACBackbone(DepthBackbone):
         ).to(self.device)
 
         model_dict = self.model.state_dict()
-        filtered = {k: v for k, v in state.items() if k in model_dict}
+        # Drop non-tensor metadata entries (height/width are ints) before
+        # filtering — they'd never be in model_dict but we explicitly skip
+        # them so they don't show up in the "ignored" report below.
+        meta_keys = {"height", "width", "epoch", "step"}
+        param_state = {k: v for k, v in state.items()
+                       if k not in meta_keys}
+        filtered = {k: v for k, v in param_state.items() if k in model_dict}
         n_total = len(model_dict)
         n_loaded = len(filtered)
-        unexpected = [k for k in state.keys() if k not in model_dict
-                      and k not in ("height", "width")]
+        unexpected = [k for k in param_state.keys() if k not in model_dict]
         self.model.load_state_dict(filtered, strict=False)
         print(f"[EndoDAC] loaded {n_loaded}/{n_total} model params from "
               f"depth_model.pth (feed {feed_h}x{feed_w})")
