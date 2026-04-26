@@ -56,111 +56,117 @@ class EndoDACBackbone(DepthBackbone):
     EndoDAC: Efficient Adapting Foundation Model for Self-Supervised
     Endoscopic Depth Estimation (Cui et al., MICCAI 2024).
 
-    Install (one-time):
-        git clone https://github.com/BeileiCui/EndoDAC external/EndoDAC
-        # download backbone:
-        #   https://drive.google.com/file/d/163ILZcnz_-IUoIgy1UF_r7PAQBqgDbll
+    Mirrors the inference flow in EndoDAC/test_simple.py:
+        depther = models.endodac.endodac(
+            backbone_size="base", r=4, lora_type="dvlora",
+            image_shape=(feed_h, feed_w),
+            pretrained_path="<repo>/pretrained_model",
+            residual_block_indexes=[2,5,8,11], include_cls_token=True)
+        depther.load_state_dict({k: v for k, v in depth_model.items()
+                                 if k in depther.state_dict()})
+        out = depther(image_tensor)["disp", 0]    # disparity-like
+
+    Install:
+        git clone https://github.com/BeileiCui/EndoDAC.git external/EndoDAC
+        # backbone (one .pth, ~390 MB):
+        # https://drive.google.com/file/d/163ILZcnz_-IUoIgy1UF_r7PAQBqgDbll
         # → external/EndoDAC/pretrained_model/depth_anything_vitb14.pth
-        # download EndoDAC adapter checkpoints (folder):
-        #   https://drive.google.com/file/d/1qzAYBtwYJDN7hEi6pApqBOOz6pUhyY70
-        # → external/EndoDAC/EndoDAC_fullmodel/depth_model.pth (and others)
+        # adapter (folder with depth_model.pth):
+        # https://drive.google.com/file/d/1qzAYBtwYJDN7hEi6pApqBOOz6pUhyY70
+        # → external/EndoDAC/EndoDAC_fullmodel/depth_model.pth
 
-    Then:
-        EndoDACBackbone(
-            repo_dir="external/EndoDAC",
-            weights_path="external/EndoDAC/EndoDAC_fullmodel/depth_model.pth",
-        )
-
-    Output is a *disparity-like* prediction (larger = closer), the same
-    convention as DAv2's relative variants. Calibrate with
-    fit_disparity_to_depth() if GT depth is available.
+    Output is a *disparity-like* prediction (larger = closer), same
+    convention as DAv2 relative variants. Use fit_disparity_to_depth().
     """
 
     is_metric = False
 
     def __init__(self, repo_dir, weights_path, device=None,
-                 input_size=(280, 350), encoder="vitb"):
+                 pretrained_dir=None, lora_rank=4, lora_type="dvlora",
+                 residual_block_indexes=(2, 5, 8, 11),
+                 include_cls_token=True):
         if not os.path.isdir(repo_dir):
             raise FileNotFoundError(
-                f"EndoDAC repo not found at {repo_dir}. "
-                f"Clone https://github.com/BeileiCui/EndoDAC first.")
-        if not os.path.isfile(weights_path):
+                f"EndoDAC repo not found at {repo_dir}.")
+
+        # weights_path may be a folder containing depth_model.pth, or the
+        # .pth file directly.
+        depth_model_path = (
+            os.path.join(weights_path, "depth_model.pth")
+            if os.path.isdir(weights_path) else weights_path)
+        if not os.path.isfile(depth_model_path):
             raise FileNotFoundError(
-                f"EndoDAC depth_model not found at {weights_path}.")
+                f"EndoDAC depth_model.pth not found at {depth_model_path}.")
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.input_size = input_size
         self.repo_dir = os.path.abspath(repo_dir)
         if self.repo_dir not in sys.path:
             sys.path.insert(0, self.repo_dir)
 
-        # The class lives at networks.depth_anything.dpt.DepthAnything in the
-        # public EndoDAC repo. Import it lazily so the rest of this file
-        # remains usable on systems without EndoDAC installed.
+        if pretrained_dir is None:
+            pretrained_dir = os.path.join(self.repo_dir, "pretrained_model")
+        if not os.path.isdir(pretrained_dir):
+            raise FileNotFoundError(
+                f"EndoDAC pretrained_model dir not found at {pretrained_dir}. "
+                f"Place depth_anything_vitb14.pth inside it.")
+
+        # Lazy-import the EndoDAC `endodac` factory function
         try:
-            mod = importlib.import_module("networks.depth_anything.dpt")
-            DepthAnything = getattr(mod, "DepthAnything", None) or \
-                getattr(mod, "DPT_DINOv2", None)
-            if DepthAnything is None:
-                raise AttributeError(
-                    "Could not find DepthAnything/DPT_DINOv2 class in "
-                    "networks.depth_anything.dpt")
+            endodac_mod = importlib.import_module("models.endodac")
         except Exception as e:
             raise ImportError(
-                f"Could not import EndoDAC's DepthAnything from "
-                f"{self.repo_dir}/networks/depth_anything/dpt.py.\n  {e}")
+                f"Could not import models.endodac from {self.repo_dir}.\n"
+                f"Did you copy the EndoDAC source into the repo dir? "
+                f"Expected path: {self.repo_dir}/models/endodac/endodac.py\n  {e}")
 
-        # vitb14 config used by EndoDAC's released checkpoint
-        cfg = {
-            "encoder": encoder,
-            "features": 128,
-            "out_channels": [96, 192, 384, 768],
-            "use_bn": False,
-            "use_clstoken": False,
-        }
-        try:
-            self.model = DepthAnything(cfg)
-        except TypeError:
-            # Older signature accepts kwargs
-            self.model = DepthAnything(**cfg)
-        self.model = self.model.to(self.device)
+        # The released checkpoint stores its training resolution
+        state = torch.load(depth_model_path, map_location=self.device)
+        feed_h = int(state.get("height", 224))
+        feed_w = int(state.get("width", 280))
+        self.feed_size = (feed_h, feed_w)
 
-        state = torch.load(weights_path, map_location=self.device)
-        if isinstance(state, dict) and "model" in state:
-            state = state["model"]
-        # Strip a "module." prefix if the checkpoint was saved with DDP
-        state = {k.replace("module.", "", 1): v for k, v in state.items()}
-        missing, unexpected = self.model.load_state_dict(state, strict=False)
-        if missing:
-            print(f"[EndoDAC] {len(missing)} missing keys (first 3): "
-                  f"{missing[:3]}")
+        self.model = endodac_mod.endodac(
+            backbone_size="base",
+            r=lora_rank,
+            lora_type=lora_type,
+            image_shape=(feed_h, feed_w),
+            pretrained_path=pretrained_dir,
+            residual_block_indexes=list(residual_block_indexes),
+            include_cls_token=include_cls_token,
+        ).to(self.device)
+
+        model_dict = self.model.state_dict()
+        filtered = {k: v for k, v in state.items() if k in model_dict}
+        n_total = len(model_dict)
+        n_loaded = len(filtered)
+        unexpected = [k for k in state.keys() if k not in model_dict
+                      and k not in ("height", "width")]
+        self.model.load_state_dict(filtered, strict=False)
+        print(f"[EndoDAC] loaded {n_loaded}/{n_total} model params from "
+              f"depth_model.pth (feed {feed_h}x{feed_w})")
         if unexpected:
-            print(f"[EndoDAC] {len(unexpected)} unexpected keys (first 3): "
-                  f"{unexpected[:3]}")
+            print(f"[EndoDAC] {len(unexpected)} non-model keys ignored "
+                  f"(first 3: {unexpected[:3]})")
         self.model.eval()
 
     @torch.no_grad()
     def predict(self, rgb_u8):
+        from PIL import Image
         H, W = rgb_u8.shape[:2]
-        ih, iw = self.input_size
-        # DepthAnything expects ImageNet-normalized float in [0, 1]
-        x = rgb_u8.astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        x = (x - mean) / std
-        x = np.transpose(x, (2, 0, 1))[None]  # 1x3xHxW
+        feed_h, feed_w = self.feed_size
+        # Match test_simple.py exactly: PIL resize + ToTensor (no ImageNet
+        # normalization — EndoDAC's adapter expects raw [0, 1] tensors).
+        img = Image.fromarray(rgb_u8).resize((feed_w, feed_h), Image.LANCZOS)
+        x = np.asarray(img, dtype=np.float32) / 255.0
+        x = np.transpose(x, (2, 0, 1))[None]
         x = torch.from_numpy(x).to(self.device)
-        x = torch.nn.functional.interpolate(
-            x, size=(ih, iw), mode="bilinear", align_corners=False)
-        pred = self.model(x)
-        if isinstance(pred, (list, tuple)):
-            pred = pred[0]
-        if pred.dim() == 3:
-            pred = pred.unsqueeze(1)
-        pred = torch.nn.functional.interpolate(
-            pred, size=(H, W), mode="bicubic", align_corners=False,
-        ).squeeze(1).squeeze(0)
-        return pred.float().cpu().numpy()
+        out = self.model(x)
+        disp = out[("disp", 0)] if isinstance(out, dict) else out
+        if disp.dim() == 3:
+            disp = disp.unsqueeze(1)
+        disp = torch.nn.functional.interpolate(
+            disp, size=(H, W), mode="bilinear", align_corners=False)
+        return disp.squeeze(1).squeeze(0).float().cpu().numpy()
 
 
 def make_backbone(name, **kwargs):
