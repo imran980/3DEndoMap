@@ -64,6 +64,32 @@ def _read_c3vd_depth_mm(path, target_hw=None):
     return raw.astype(np.float32) * (100.0 / 65535.0)
 
 
+def _align_trajectory_to_organ(cam_positions, centerline, max_corr=80.0):
+    """Rigid (R,t) ICP fitting the camera trajectory onto the organ
+    centerline, so the reveal/coverage frustum tests actually hit the
+    pre-op mesh. _pose_to_organ_space() only fixes the rotation between
+    C3VD's pose convention and the OBJ; this fixes the residual translation
+    (and refines rotation) by aligning the trajectory curve with the
+    centerline curve.
+
+    Returns (T_4x4, fitness).
+    """
+    src = o3d.geometry.PointCloud()
+    src.points = o3d.utility.Vector3dVector(cam_positions.astype(np.float64))
+    tgt = o3d.geometry.PointCloud()
+    tgt.points = o3d.utility.Vector3dVector(centerline.astype(np.float64))
+
+    t0 = centerline.mean(axis=0) - cam_positions.mean(axis=0)
+    T_init = np.eye(4)
+    T_init[:3, 3] = t0
+
+    icp = o3d.pipelines.registration.registration_icp(
+        src, tgt, max_corr, T_init,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=300))
+    return icp.transformation, float(icp.fitness)
+
+
 def run(args):
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -174,6 +200,26 @@ def run(args):
     if organ_mesh is not None:
         organ_pts = np.asarray(organ_mesh.vertices, dtype=np.float64)
         centerline = compute_organ_centerline(organ_mesh, n_points=200)
+
+        # Snap the camera trajectory onto the organ centerline so the frustum
+        # tests in coverage/reveal modes actually hit the mesh. _pose_to_organ
+        # _space() handles the rotation between C3VD pose convention and the
+        # OBJ; this ICP fixes the residual translation (and refines rotation).
+        if not args.no_trajectory_align:
+            T_align, fit = _align_trajectory_to_organ(
+                cam_positions, centerline,
+                max_corr=args.trajectory_align_max_corr)
+            print(f"Trajectory->organ ICP: fitness={fit:.3f}")
+            R = T_align[:3, :3]
+            t = T_align[:3, 3]
+            cam_positions = (R @ cam_positions.T).T + t
+            cam_forwards = (R @ cam_forwards.T).T
+            norms = np.linalg.norm(cam_forwards, axis=1, keepdims=True)
+            cam_forwards = np.where(
+                norms > 1e-6, cam_forwards / np.maximum(norms, 1e-9),
+                np.array([0, 0, -1.0]))
+            poses = [T_align @ p for p in poses]
+
         gps_data = {
             'organ_pts': organ_pts,
             'centerline': centerline,
@@ -369,5 +415,10 @@ if __name__ == "__main__":
     p.add_argument("--voxel_size", default=0.5, type=float,
                    help="TSDF voxel size mm (dynamic mode)")
     p.add_argument("--mesh_update_every", default=15, type=int)
+    p.add_argument("--no_trajectory_align", action="store_true",
+                   help="Skip the trajectory->centerline ICP (default: on). "
+                        "Disable only if you've already aligned poses.")
+    p.add_argument("--trajectory_align_max_corr", default=80.0, type=float,
+                   help="Max correspondence distance (mm) for trajectory ICP")
     args = p.parse_args()
     run(args)
