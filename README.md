@@ -2,41 +2,54 @@
 
 3DEndoMap turns a monocular endoscopic video into a live **surgical
 navigation dashboard**: the camera's position inside the organ, a 3D
-map of inspected anatomy, and clinical metrics (withdrawal time,
-pullback speed, coverage percentage) composited into a single MP4.
+map of inspected anatomy, and clinical metrics (procedure time,
+withdrawal speed, coverage percentage) composited into a single MP4.
+
+> **Primary target: bronchoscopy.** The project pivoted from
+> colonoscopy (C3VD) to **bronchoscopy** because the airway tree is
+> *rigid* (cartilage rings prevent deformation), *branching*
+> (carinas give natural SLAM landmarks), *shorter* (5–15 min vs
+> 20–60), and *CT-based pre-op planning is universal* — every patient
+> has an airway CT, which maps perfectly onto the existing
+> `--reveal_organ` mode. Colonoscopy is harder on every axis (long
+> deformable tube, low texture, peristalsis) and stays as a
+> secondary / legacy code path.
 
 The project began as a fork of **Endo-4DGS** (MICCAI 2024) for 4D
 Gaussian Splatting reconstruction, then grew into a standalone
 pipeline that:
 
-- ingests raw **C3VD** colonoscopy phantom data (or any sequence with
-  RGB + per-frame poses),
+- ingests endoscopy data (bronchoscopy primary, colonoscopy legacy
+  via the C3VD path) — RGB + per-frame poses, optionally with GT
+  depth and a pre-operative CT mesh,
 - runs an off-the-shelf **monocular depth backbone** (EndoDAC, the
   endoscopy-specific depth model from MICCAI 2024 — or DAv2 as a
   generic fallback),
-- fuses depth + poses into a **growing 3D mesh** of the organ via
-  TSDF, and / or uses a pre-operative CT mesh painted in by the
+- fuses depth + poses into a **growing 3D mesh** of the airway / organ
+  via TSDF, and / or uses a pre-operative CT mesh painted in by the
   camera's frustum, and
 - composites everything onto a clinician-style dashboard.
 
 **Full project scope** (today + planned):
 The end goal is a clinician-facing tool that, given just a live
-endoscopic video, shows (1) **where** the camera is in 3D anatomy,
-(2) **what** is in front of it (anatomy, polyps, tools, bleeding —
-auto-segmented), (3) **how much** has been inspected vs. missed, and
-(4) **how trustworthy** every ML-derived overlay is. Today only
-1 + 3 are implemented (on phantom data with GT poses). The roadmap
-adds monocular SLAM (drops the GT-pose requirement), online 4D
-Gaussian fusion, anatomical shape priors, **per-frame semantic
-segmentation overlays**, and a **calibrated confidence / trust
-layer** that surfaces "how much to rely on this" alongside every
-ML output — the safety property that separates a research demo
-from a clinical tool.
+bronchoscopic video, shows (1) **where** the scope is in the airway
+tree, (2) **what** is in front of it (lobar landmarks, lesions,
+biopsy tools, bleeding — auto-segmented), (3) **which segments**
+have been inspected vs. missed, and (4) **how trustworthy** every
+ML-derived overlay is. Today only 1 + 3 are implemented (on phantom
+data with GT poses). The roadmap adds monocular SLAM (drops the
+GT-pose requirement), online 4D Gaussian fusion, anatomical shape
+priors, **per-frame semantic segmentation overlays**, and a
+**calibrated confidence / trust layer** that surfaces "how much to
+rely on this" alongside every ML output — the safety property that
+separates a research demo from a clinical tool.
 
-> Status. **Research-grade demo on phantom data.** It works
-> end-to-end on C3VD because C3VD ships ground-truth poses and an
-> exact CT mesh of the phantom. Both of those disappear in the OR;
-> see the **Roadmap** for what's needed to take this clinical.
+> Status. **Research-grade demo on phantom data.** End-to-end works
+> on C3VD (colon phantom) today because C3VD ships ground-truth
+> poses and an exact CT mesh. The bronchoscopy port reuses ~90% of
+> the code; the missing 10% is dataset prep + a bronchoscopy-tuned
+> hFOV. See the **Bronchoscopy port** section below and the
+> **Roadmap** for what's needed beyond the phantom demo.
 
 ---
 
@@ -60,12 +73,12 @@ from a clinical tool.
 
 ```mermaid
 flowchart LR
-    A[C3VD or any RGB+poses] --> B(prepare_c3vd.py)
+    A[Bronchoscopy / C3VD / any RGB+poses] --> B(prepare_*.py)
     A --> C(render_navigation_c3vd.py)
     A --> D(build_colon_from_dav2.py)
     A --> E(build_colon_from_c3vd.py)
     B --> F(scripts/pre_dam_dep.py)
-    F --> G(train.py – Endo-4DGS)
+    F --> G(train.py – Endo-4DGS, optional)
     G --> H(render.py / render_navigation.py)
     D -. depth backbone .-> I[depth_backbones.py: DAv2 / EndoDAC]
     C -. depth backbone .-> I
@@ -73,12 +86,59 @@ flowchart LR
     D -- learned depth --> J
     C -- learned depth --> J
     C --> K[navigation_dashboard.mp4]
-    J --> L[colon_mesh.ply]
+    J --> L[airway_or_colon_mesh.ply]
 ```
+
+The same code path serves both bronchoscopy and colonoscopy — only
+the dataset-prep script and pre-op organ mesh change.
 
 ---
 
-## 2. End-to-end on C3VD (the only thing you need most days)
+## 2. Bronchoscopy port (primary target — work in progress)
+
+**Why bronchoscopy first.** Of the endoscopy procedures we considered
+(colon, bronchi, sinonasal, upper-GI, hysteroscopy, arthroscopy), the
+airways are the easiest to reconstruct accurately:
+
+| Property | Bronchoscopy | Colonoscopy | Why it matters |
+|---|---|---|---|
+| Tissue rigidity | rigid (cartilage rings) | deformable (peristalsis, scope pressure) | TSDF / SLAM averaging works |
+| Topology | branching tree | long curved tube | branch points = SLAM landmarks + loop closure |
+| Texture | vascular pattern + cartilage ridges | low-texture mucosa | feature matching is reliable |
+| Procedure length | 5–15 min | 20–60 min | smaller datasets, faster iteration |
+| Pre-op CT | universal (every chest CT shows airways) | rare for screening | `--reveal_organ` mode gets a real prior per patient |
+| Public datasets | EndoMapper-Bronchus, BREAD phantom, IRCAD | C3VD, Kvasir, EndoMapper-Colon | comparable availability |
+
+**What needs to change in the codebase (~90% reusable):**
+
+| Module | Change required |
+|---|---|
+| `prepare_c3vd.py` | Fork into `prepare_bronchus.py` for the new dataset's pose/depth format. Trivial — same shape. |
+| `prepare_*.py` defaults | hFOV ~90° (bronchoscopes), not 140° (colonoscopes). |
+| `arguments/c3vd.py` | New `arguments/bronchus.py` for any tuning (probably identical at first). |
+| `_pose_to_organ_space` | Re-derive the rotation between dataset-pose-frame and the bronchial-tree CT mesh via a one-off `check_alignment.py` sweep. |
+| `dataset/trans_model.obj` | Replace with a bronchial-tree mesh (segmented airway from a chest CT). |
+| `render_navigation_c3vd.py` | **No code change.** Pass `--c3vd_dir <bronchus_dataset> --organ_mesh <airway_tree.ply>` and it works. |
+| Everything else | unchanged: `depth_backbones.py`, EndoDAC, `dynamic_organ.py`, `dashboard_common.py`, `check_alignment.py`. |
+
+**Open tasks for the bronchoscopy port (in priority order):**
+
+1. **Dataset acquisition** — pick one of EndoMapper-Bronchus,
+   BREAD phantom, or a private clinical clip. Need RGB + poses
+   (phantom → external tracker; clinical → SLAM, see Phase 1).
+2. **Airway-tree CT segmentation** — pull a chest CT, segment the
+   bronchial lumen (3D Slicer + the `Lung CT Analyzer` extension or
+   the `pulmo3D` package). Export as `.ply` / `.obj`.
+3. **Write `prepare_bronchus.py`** mirroring `prepare_c3vd.py`.
+4. **Tune `--hfov 90`** and run the existing dashboard pipeline.
+5. **Verify with `check_alignment.py`** against the segmented airway.
+
+Effort: ~1 week for the first end-to-end demo with a phantom
+sequence (mostly dataset wrangling, not code).
+
+---
+
+## 3. End-to-end on C3VD (legacy / colonoscopy reference path)
 
 ```bash
 # 0. Install
@@ -131,7 +191,7 @@ poses currently scores ~0.66 on `trans_t1_b`.
 
 ---
 
-## 3. Repo layout
+## 4. Repo layout
 
 ```
 prepare_c3vd.py             C3VD → EndoNeRF format
@@ -160,7 +220,7 @@ arguments/  scene/  gaussian_renderer/  utils/  submodules/
 
 ---
 
-## 4. Honest assessment — does it work for a real surgeon?
+## 5. Honest assessment — does it work for a real surgeon?
 
 **No.** Not yet. The C3VD demo works because C3VD provides:
 
@@ -179,7 +239,7 @@ are still missing before this is clinically useful.
 
 ---
 
-## 5. Roadmap to a clinical tool
+## 6. Roadmap to a clinical tool
 
 The list below is ordered by build cost. Each phase produces a working
 demo at the end; each unlocks the next.
@@ -189,16 +249,29 @@ demo at the end; each unlocks the next.
 - Useful as a teaching tool, demo, and integration shell. Not clinical.
 
 ### Phase 1 — Drop the GT-pose dependency: monocular SLAM
-- **Replace C3VD `pose.txt` with live visual odometry.**
+- **Replace `pose.txt` with live visual odometry.** Bronchoscopy-first
+  is a major win here: branching airways give the SLAM matcher
+  natural landmarks (carinas) and built-in loop closures every time
+  the scope passes a bifurcation, instead of the long, low-texture
+  drift you get in a colon.
 - **SOTA option (best fit):** **Endo-2DTAM** — Gaussian-Splatting SLAM
   for endoscopic scenes (the same authors as Endo-4DGS).
   https://github.com/lastbasket/Endo-2DTAM
 - **Alternates:** DROID-SLAM, ORB-SLAM3, MonoGS / RTG-SLAM. All
-  general-purpose; expect drift on long featureless tubes.
-- **Deliverable:** dashboard works on a sequence with **only RGB**
-  (no `pose.txt`), poses estimated live. Acceptance: trajectory ICP
-  fitness ≥ 0.5 vs C3VD GT poses on `trans_t1_b`.
-- **Effort:** 4–6 weeks of integration.
+  general-purpose; expect drift on long featureless tubes — but the
+  airway tree is *not* featureless, so even the general-purpose
+  systems should converge on bronchoscopy without much tuning.
+- **Bronchoscopy-specific helpers worth adding:**
+  - **Branch-point detection** in 2D (carinas are visually
+    distinctive) → strong relocalization anchors.
+  - **CT-airway-tree matching** — once we know the topological
+    sequence of branches the camera passed, snap to the segmented
+    airway from the patient's CT (best of monocular SLAM + CT prior).
+- **Deliverable:** dashboard works on a sequence with **only RGB**,
+  poses estimated live. Acceptance: trajectory ICP fitness ≥ 0.5
+  vs ground-truth poses on a phantom bronchus run.
+- **Effort:** 3–5 weeks (less than colon because of the branch
+  landmarks).
 
 ### Phase 2 — Drop the static-TSDF assumption: online Gaussian fusion
 - **Replace `Open3D.ScalableTSDFVolume` with an online 3D Gaussian
@@ -213,6 +286,13 @@ demo at the end; each unlocks the next.
 - **Effort:** 4–8 weeks; needs GPU at inference (≥ 16 GB VRAM).
 
 ### Phase 3 — Drop the exact-mesh assumption: anatomical shape prior
+
+> **Bronchoscopy advantage:** every patient already has a chest CT,
+> so the **patient-specific CT prior (3.1)** is the realistic clinical
+> default — no SSM dataset wrangling needed. The harder Phase 3.2 / 3.3
+> options stay relevant for colonoscopy (where pre-op CT is rare for
+> screening) and for handling deformation.
+
 - **Add a Statistical Shape Model (SSM) of the colon as a soft
   Bayesian prior.** Where the camera has seen tissue → trust the
   reconstruction; where it hasn't → fall back to the prior with a
@@ -251,9 +331,13 @@ demo at the end; each unlocks the next.
 ### Phase 5 — Per-frame semantic segmentation overlays
 - **What:** add a pluggable **segmentation backbone** (mirroring
   `depth_backbones.py`) that produces per-pixel masks for clinically
-  relevant classes — **polyps, anatomy landmarks (lumen / haustra /
-  ileocecal valve), surgical tools, bleeding, image-quality
-  (clear / bubbles / stool / blur)**.
+  relevant classes. Class set is procedure-specific:
+  - **Bronchoscopy (primary):** lumen / carina (branch point) /
+    bronchial generation level (1°, 2°, 3°…) / lesion or nodule /
+    biopsy tool / blood / mucus / image quality.
+  - **Colonoscopy (legacy):** polyps / anatomy landmarks
+    (lumen / haustra / ileocecal valve) / surgical tools / bleeding /
+    image quality (clear / bubbles / stool / blur).
 - **Where it shows up:**
   1. **Endo panel**: colored translucent masks overlaid on the live
      frame.
@@ -351,19 +435,31 @@ they're the highest clinical-value pair on this list.
 
 ---
 
-## 6. Other dataset paths (not the focus, but supported)
+## 7. Datasets
 
-- **EndoNeRF**: train via Endo-4DGS as documented in the original
+**Primary (bronchoscopy):**
+- **EndoMapper** (Cogan et al.) — multi-procedure clinical endoscopy
+  collection including bronchoscopy clips with intrinsics. Apply
+  through the EndoMapper portal.
+- **BREAD bronchoscopy phantom** (Sganga et al.) — silicone airway
+  phantom with synchronized RGB + tracker poses. Public.
+- **IRCAD bronchoscopy** — phantom + cadaver clips, request-based.
+- **Patient-specific airway CT** — required for `--reveal_organ`
+  mode. Segment with **3D Slicer + Lung CT Analyzer** or
+  **pulmo3D**, export `.ply` / `.obj`. Use this even for phantom
+  runs by scanning the phantom itself.
+
+**Legacy (colonoscopy / general endoscopy):**
+- **C3VD** colon phantom — prep with `prepare_c3vd.py`
+  (defaults: hFOV ≈ 140°, the wide-FOV Olympus colonoscope).
+- **EndoNeRF** — train via Endo-4DGS as documented in the original
   paper. Use `arguments/endonerf.py`.
-- **StereoMIS**: run `prepare_stereomis.sh`, then standard Endo-4DGS
-  training via `arguments/stereomis.py`.
-- **C3VD**: prep with `prepare_c3vd.py` (defaults assume the wide-FOV
-  Olympus colonoscope, hFOV ≈ 140°). Use the new
-  `render_navigation_c3vd.py` instead of the Endo-4DGS dashboard.
+- **StereoMIS** — run `prepare_stereomis.sh`, then standard
+  Endo-4DGS training via `arguments/stereomis.py`.
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -376,7 +472,7 @@ they're the highest clinical-value pair on this list.
 
 ---
 
-## 8. Citations
+## 9. Citations
 
 This work builds on:
 
