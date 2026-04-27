@@ -19,6 +19,20 @@ pipeline that:
   camera's frustum, and
 - composites everything onto a clinician-style dashboard.
 
+**Full project scope** (today + planned):
+The end goal is a clinician-facing tool that, given just a live
+endoscopic video, shows (1) **where** the camera is in 3D anatomy,
+(2) **what** is in front of it (anatomy, polyps, tools, bleeding —
+auto-segmented), (3) **how much** has been inspected vs. missed, and
+(4) **how trustworthy** every ML-derived overlay is. Today only
+1 + 3 are implemented (on phantom data with GT poses). The roadmap
+adds monocular SLAM (drops the GT-pose requirement), online 4D
+Gaussian fusion, anatomical shape priors, **per-frame semantic
+segmentation overlays**, and a **calibrated confidence / trust
+layer** that surfaces "how much to rely on this" alongside every
+ML output — the safety property that separates a research demo
+from a clinical tool.
+
 > Status. **Research-grade demo on phantom data.** It works
 > end-to-end on C3VD because C3VD ships ground-truth poses and an
 > exact CT mesh of the phantom. Both of those disappear in the OR;
@@ -234,32 +248,106 @@ demo at the end; each unlocks the next.
   not just growing.
 - **Effort:** research project; expected at the end of this roadmap.
 
-### Phase 5 — Calibrated uncertainty + clinical UI
-- Stock NN confidences are overconfident. To deliver a defensible
-  "1–3 mm error in observed regions, 5–15 mm in predicted" channel,
-  add **conformal prediction** or **deep ensembles** on the depth
-  backbone, then propagate uncertainty through fusion.
-- Build a clinician-facing UI on top: bookmark/export findings,
-  withdrawal-quality report, missed-region alerts, polyp-size
-  measurements via depth.
-- **Effort:** 6+ weeks; minimum viable demo can land in 2.
+### Phase 5 — Per-frame semantic segmentation overlays
+- **What:** add a pluggable **segmentation backbone** (mirroring
+  `depth_backbones.py`) that produces per-pixel masks for clinically
+  relevant classes — **polyps, anatomy landmarks (lumen / haustra /
+  ileocecal valve), surgical tools, bleeding, image-quality
+  (clear / bubbles / stool / blur)**.
+- **Where it shows up:**
+  1. **Endo panel**: colored translucent masks overlaid on the live
+     frame.
+  2. **3D map**: back-project mask centroids through depth + pose
+     onto the organ surface — polyps become persistent 3D markers
+     you can revisit.
+  3. **HUD**: per-finding counters ("polyps detected: 3"), and an
+     image-quality % that drives the existing withdrawal-quality
+     metric.
+- **SOTA options (off-the-shelf, no training):**
+  - **SAM2 / SAM2-Video** (Meta, 2024) — class-agnostic, prompt-trackable across frames.
+  - **MedSAM** (Nature 2024) — medical-tuned SAM.
+  - **Polyp-PVT / FCBFormer / TransNetR** — colonoscopy polyp segmentation.
+  - **Surgical-SAM** family — surgical-tool segmentation.
+- **Deliverable:** dashboard with a fourth "findings" overlay; every
+  mask clickable to a 3D location; report at the end listing all
+  flagged findings with thumbnails + GPS positions.
+- **Effort:** ~250 LOC for SAM2 + a polyp head, ~6 hours integration.
+  Calibrating against a labeled dataset (Kvasir-SEG, CVC-ClinicDB) is
+  another 2–3 days for evaluation.
+
+### Phase 6 — Calibrated confidence / trust layer
+- **Why:** stock NN confidences are overconfident. A clinical tool
+  needs every ML-derived overlay to come with a defensible
+  "trust this how much?" signal. This phase adds a **unified
+  uncertainty channel** spanning depth, segmentation, pose, mesh,
+  and (eventually) the SSM prior.
+- **Per-output uncertainty sources:**
+  - **Depth (EndoDAC / DAv2):** test-time augmentation variance
+    (predict 4× with horizontal flip / brightness jitter, take
+    per-pixel std-dev). Already available in `depth_backbones.py`
+    interface — needs a `predict_with_uncertainty()` method.
+  - **Segmentation:** sigmoid logit margin per pixel; MC-dropout
+    when the backbone supports it.
+  - **Pose (SLAM):** inlier ratio + reprojection error from the
+    matcher.
+  - **TSDF mesh:** voxel weight (Open3D already tracks how many
+    frames touched each voxel).
+  - **Coverage / reveal:** number of frustum hits per vertex
+    (already computed; just expose).
+- **Calibration to make confidences honest:**
+  - **Temperature scaling** on a held-out set (~5 LOC).
+  - **Conformal prediction** for actual coverage guarantees
+    ("90% of pixels are within ±N mm at this confidence").
+  - **Deep ensembles / MC-dropout** where the backbone supports it.
+- **How it surfaces on the dashboard:**
+  1. **Translucency / hatching:** high-confidence regions opaque,
+     low-confidence translucent or hatched, on every overlay
+     (mask, mesh, coverage, reveal, predicted-from-prior regions).
+  2. **Dedicated uncertainty panel:** grayscale heatmap, dark = trust,
+     bright = doubt, sitting beside the depth panel.
+  3. **HUD numbers:** "Mean depth uncertainty: 2.3 mm",
+     "Polyp confidence: 0.78", "Pose drift: 1.2 mm/frame".
+  4. **Alert thresholds:** popup when confidence drops below a
+     threshold (obscured frame, occluded region, tracker lost).
+- **Deliverable:** every overlay on the dashboard answers
+  "how much should the surgeon believe this?" without requiring
+  ML literacy. Same module is reused by phase 3's anatomical-prior
+  uncertainty channel.
+- **Effort:** ~250 LOC for the confidence interface + per-backbone
+  hooks + dashboard rendering, ~6 hours of integration. Adding
+  conformal prediction with a real labeled set: +1 week.
+
+### Phase 7 — Clinical UI on top
+- Bookmark / export findings (PDF report with thumbnails + 3D
+  positions, exportable per-procedure).
+- Withdrawal-quality scorecard (time, speed, coverage, missed
+  regions, image-quality %).
+- Missed-region alerts in real time ("you didn't look at the cecum
+  for 90 s").
+- Polyp size measurements via depth (click two points, report mm).
+- Replay mode for case review with full overlays + uncertainties.
+- **Effort:** 6+ weeks; minimum viable scorecard can land in 2.
 
 ### Suggested team / parallelism
 
 | Phase | Can start immediately | Blocks on |
 |---|---|---|
-| 1 (SLAM)            | yes | — |
-| 2 (online 3DGS)     | yes | — |
-| 3.1 (CT prior)      | yes | — |
-| 3.2 (SSM)           | yes (data work) | colon dataset |
-| 3.3 (diffusion)     | yes (research) | — |
-| 4 (4D)              | partial | phase 2 |
-| 5 (uncertainty + UI)| yes | — |
+| 1 (SLAM)                  | yes | — |
+| 2 (online 3DGS)           | yes | — |
+| 3.1 (CT prior)            | yes | — |
+| 3.2 (SSM)                 | yes (data work) | colon dataset |
+| 3.3 (diffusion)           | yes (research) | — |
+| 4 (4D)                    | partial | phase 2 |
+| 5 (segmentation overlays) | yes | — |
+| 6 (confidence / trust)    | yes | works best after 5 + 1 + 3 |
+| 7 (clinical UI)           | yes | strongest after 5 + 6 |
 
-A 3-person split would be: SLAM lead (phase 1+2), Anatomical-prior
-lead (phase 3+4), Clinical-UI / uncertainty lead (phase 5). Phase 1
-output unlocks real-OR data collection; phase 3 unlocks unseen-region
-honesty; phase 5 unlocks clinical conversation.
+A 3-person split would be: **SLAM + 4D lead** (phases 1 + 2 + 4),
+**Anatomical-prior + segmentation lead** (phases 3 + 5),
+**Confidence + clinical-UI lead** (phases 6 + 7). Phases 5 and 6
+together are what turn the demo from "shows organ shape" into
+"shows organ shape, what's in it, and how much to trust either" —
+they're the highest clinical-value pair on this list.
 
 ---
 
