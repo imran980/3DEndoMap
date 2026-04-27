@@ -11,3 +11,5 @@ onnxruntime-gpu
 opencv-python
 tqdm
 imageio[ffmpeg]
+transformers>=4.40
+accelerate
