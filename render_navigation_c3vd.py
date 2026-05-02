@@ -162,28 +162,44 @@ def run(args):
                            repo_dir=args.endodac_repo,
                            weights_path=args.endodac_weights)
 
-    # ---- Calibration (relative variants only, needs GT) ----
+    # ---- Calibration (relative variants only) ----
+    # If GT depth is available we fit per-frame depth = a/pred + b against
+    # it. If not (e.g. arbitrary bronchoscopy video), we fall back to a
+    # *scale-only* calibration that anchors median predicted disparity to
+    # an assumed median scene depth (--assumed_median_depth_mm).
     a_avg = b_avg = None
     if not bb.is_metric:
         gt_idx = [i for i, p in enumerate(gt_depth_paths) if p]
-        if not gt_idx:
-            sys.exit("ERROR: relative backbone needs C3VD GT depth files for "
-                     "calibration.")
-        cal_idx = gt_idx[::max(1, len(gt_idx) // args.calibration_frames)] \
-            [:args.calibration_frames]
-        a_list, b_list = [], []
-        for i in tqdm(cal_idx, desc="Calibration"):
-            rgb = cv2.cvtColor(cv2.imread(rgb_paths[i]), cv2.COLOR_BGR2RGB)
-            pred = bb.predict(rgb)
-            gt_mm = _read_c3vd_depth_mm(gt_depth_paths[i], target_hw=(H, W))
-            a, b = fit_disparity_to_depth(pred, gt_mm)
-            if a is not None:
-                a_list.append(a)
-                b_list.append(b)
-        a_avg = float(np.median(a_list))
-        b_avg = float(np.median(b_list))
-        print(f"Global calib (median over {len(a_list)} frames): "
-              f"a={a_avg:.2f}, b={b_avg:.2f}")
+        if gt_idx:
+            cal_idx = gt_idx[::max(1, len(gt_idx) // args.calibration_frames)] \
+                [:args.calibration_frames]
+            a_list, b_list = [], []
+            for i in tqdm(cal_idx, desc="Calibration"):
+                rgb = cv2.cvtColor(cv2.imread(rgb_paths[i]), cv2.COLOR_BGR2RGB)
+                pred = bb.predict(rgb)
+                gt_mm = _read_c3vd_depth_mm(gt_depth_paths[i], target_hw=(H, W))
+                a, b = fit_disparity_to_depth(pred, gt_mm)
+                if a is not None:
+                    a_list.append(a)
+                    b_list.append(b)
+            a_avg = float(np.median(a_list))
+            b_avg = float(np.median(b_list))
+            print(f"Global calib (median over {len(a_list)} frames): "
+                  f"a={a_avg:.2f}, b={b_avg:.2f}")
+        else:
+            assumed = float(getattr(args, 'assumed_median_depth_mm', 20.0))
+            sample_idx = list(range(0, len(rgb_paths),
+                                    max(1, len(rgb_paths) // 10)))[:10]
+            preds = []
+            for i in tqdm(sample_idx, desc="Auto-scale (no GT)"):
+                rgb = cv2.cvtColor(cv2.imread(rgb_paths[i]), cv2.COLOR_BGR2RGB)
+                preds.append(float(np.median(bb.predict(rgb))))
+            med_pred = float(np.median(preds)) if preds else 1.0
+            a_avg = assumed * max(med_pred, 1e-6)
+            b_avg = 0.0
+            print(f"No GT depth available; auto-scale calibration "
+                  f"(median pred={med_pred:.3f}, assumed median depth="
+                  f"{assumed:.1f} mm) -> a={a_avg:.2f}, b=0.")
 
     # ---- TSDF (dynamic mode) ----
     organ_builder = None
@@ -417,6 +433,11 @@ if __name__ == "__main__":
     p.add_argument("--skip_every", default=1, type=int)
     p.add_argument("--max_frames", default=None, type=int)
     p.add_argument("--calibration_frames", default=20, type=int)
+    p.add_argument("--assumed_median_depth_mm", default=20.0, type=float,
+                   help="Used to anchor depth scale when no GT depth is "
+                        "available (e.g. raw bronchoscopy video). 20 mm is "
+                        "a reasonable median for bronchoscopy; "
+                        "30-40 mm for colonoscopy.")
     p.add_argument("--depth_trunc", default=80.0, type=float)
     p.add_argument("--min_disparity_pct", default=10.0, type=float)
     p.add_argument("--depth_smooth_ksize", default=5, type=int)
