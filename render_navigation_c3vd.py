@@ -191,10 +191,17 @@ def run(args):
         organ_builder = DynamicOrganBuilder(
             voxel_size=args.voxel_size,
             depth_trunc=args.depth_trunc,
-            depth_min=0.5,
+            depth_min=args.tsdf_depth_min,
+            edge_margin_pct=args.tsdf_edge_margin_pct,
+            grad_thresh=args.tsdf_grad_thresh,
+            min_camera_motion_mm=args.tsdf_min_camera_motion_mm,
+            mesh_cleanup_keep_top=args.tsdf_keep_top_components,
+            mesh_cleanup_min_triangles=args.tsdf_min_component_triangles,
         )
-        print(f"TSDF: voxel={args.voxel_size} mm, "
-              f"depth_trunc={args.depth_trunc} mm")
+        print(f"TSDF: voxel={args.voxel_size} mm, depth=["
+              f"{args.tsdf_depth_min:.1f}, {args.depth_trunc:.1f}] mm, "
+              f"motion gate={args.tsdf_min_camera_motion_mm:.2f} mm, "
+              f"keep top {args.tsdf_keep_top_components} components")
 
     # ---- GPS scene data ----
     if organ_mesh is not None:
@@ -349,6 +356,7 @@ def run(args):
             reveal_mode=(args.mode == "reveal"),
             cam_pos=cam_positions[idx],
             cam_forward=cam_forwards[idx],
+            cam_trajectory=cam_positions,
             width=gps_w, height=gps_h, dpi=80)
         gps_panel = cv2.cvtColor(gps_img, cv2.COLOR_RGB2BGR)
         if gps_panel.shape[:2] != (gps_h, gps_w):
@@ -415,6 +423,26 @@ if __name__ == "__main__":
     p.add_argument("--voxel_size", default=0.5, type=float,
                    help="TSDF voxel size mm (dynamic mode)")
     p.add_argument("--mesh_update_every", default=15, type=int)
+    # --- TSDF cleanup knobs (dynamic mode) ---
+    p.add_argument("--tsdf_depth_min", default=5.0, type=float,
+                   help="Drop TSDF depth pixels closer than this (mm). "
+                        "Bumped from the legacy 0.5 because near-camera "
+                        "pixels at slow motion smear into a center blob.")
+    p.add_argument("--tsdf_edge_margin_pct", default=4.0, type=float,
+                   help="Drop TSDF depth pixels within N%% of the image "
+                        "edge (lens vignette / distortion).")
+    p.add_argument("--tsdf_grad_thresh", default=8.0, type=float,
+                   help="Drop TSDF depth pixels with steep local gradient "
+                        "(scaled by median depth). 0 = disable.")
+    p.add_argument("--tsdf_min_camera_motion_mm", default=0.5, type=float,
+                   help="Skip integrating a frame if the camera moved less "
+                        "than this from the last integration. Prevents "
+                        "blob accumulation when the scope hovers.")
+    p.add_argument("--tsdf_keep_top_components", default=3, type=int,
+                   help="After mesh extraction, keep only the N largest "
+                        "connected components. 0 = no cleanup.")
+    p.add_argument("--tsdf_min_component_triangles", default=200, type=int,
+                   help="Minimum triangles for a kept connected component.")
     p.add_argument("--no_trajectory_align", action="store_true",
                    help="Skip the trajectory->centerline ICP (default: on). "
                         "Disable only if you've already aligned poses.")

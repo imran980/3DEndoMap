@@ -371,6 +371,7 @@ def render_navigation(dataset, hyperparam, iteration, pipeline, fps=30,
                     reveal_mode=reveal_organ,
                     cam_pos=cam_positions[idx],
                     cam_forward=cam_forwards[idx],
+                    cam_trajectory=cam_positions,
                     width=gps_w, height=gps_h, dpi=80)
                 gps_bgr = cv2.cvtColor(gps_img, cv2.COLOR_RGB2BGR)
                 if gps_bgr.shape[1] != gps_w or gps_bgr.shape[0] != gps_h:

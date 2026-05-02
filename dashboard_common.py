@@ -90,6 +90,7 @@ def compute_organ_centerline(organ_mesh, n_points=200):
 
 def render_gps_frame(gps_data, current_idx, coverage_counts=None,
                      reveal_mode=False, cam_pos=None, cam_forward=None,
+                     cam_trajectory=None,
                      width=640, height=480, dpi=100):
     """3D matplotlib GPS view — see render_navigation.py for full docs."""
     fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi)
@@ -172,6 +173,25 @@ def render_gps_frame(gps_data, current_idx, coverage_counts=None,
                 colors.append([0.5, 0.5, 0.5, 0.2])
         ax.add_collection3d(Line3DCollection(segments, colors=colors,
                                              linewidths=2.0))
+
+    # Actual camera trajectory up to the current frame, drawn as a
+    # cyan polyline on top of the centerline. This is the observed
+    # path (whether from GT poses, SLAM, or VO), distinct from the
+    # PCA-derived centerline of the organ.
+    if cam_trajectory is not None and len(cam_trajectory) > 1:
+        traj = np.asarray(cam_trajectory)
+        upto = min(int(current_idx) + 1, len(traj))
+        if upto >= 2:
+            traj_segments = [
+                [traj[i], traj[i + 1]] for i in range(upto - 1)
+            ]
+            ax.add_collection3d(Line3DCollection(
+                traj_segments,
+                colors=[(0.30, 0.85, 0.95, 0.9)] * len(traj_segments),
+                linewidths=1.6))
+            # Faint dot at the trajectory start so it's always visible
+            ax.scatter(*traj[0], c=(0.30, 0.85, 0.95), s=80, zorder=8,
+                       depthshade=False)
 
     ax.scatter(*cur_pos, c='lime', s=360, zorder=10, edgecolors='white',
                linewidths=2.5, depthshade=False)
