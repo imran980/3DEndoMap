@@ -96,7 +96,48 @@ def estimate_poses(frames_dir, hfov_deg):
     return pose_path, (H, W)
 
 
+def _resolve_endodac_paths(args):
+    """Auto-fill --endodac_repo / --endodac_weights from the conventional
+    locations when the user didn't specify them. Errors clearly if the
+    backbone is set to endodac but no weights can be located."""
+    if args.backbone != "endodac":
+        return
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates_repo = [
+        args.endodac_repo,
+        os.path.join(here, "external", "EndoDAC"),
+        "external/EndoDAC",
+    ]
+    candidates_w = [
+        args.endodac_weights,
+        os.path.join(here, "external", "EndoDAC", "EndoDAC_fullmodel",
+                     "depth_model.pth"),
+        "external/EndoDAC/EndoDAC_fullmodel/depth_model.pth",
+    ]
+    if not args.endodac_repo:
+        for c in candidates_repo[1:]:
+            if c and os.path.isdir(c):
+                args.endodac_repo = c
+                print(f"Auto-detected --endodac_repo {c}")
+                break
+    if not args.endodac_weights:
+        for c in candidates_w[1:]:
+            if c and os.path.isfile(c):
+                args.endodac_weights = c
+                print(f"Auto-detected --endodac_weights {c}")
+                break
+    if not args.endodac_repo or not args.endodac_weights:
+        sys.exit(
+            "ERROR: --backbone endodac requires both --endodac_repo and "
+            "--endodac_weights, and they couldn't be auto-detected at "
+            "external/EndoDAC/...\n"
+            "Either pass them explicitly, or run with --backbone dav2 "
+            "(no checkpoints needed; lower quality on endoscopy)."
+        )
+
+
 def run(args):
+    _resolve_endodac_paths(args)
     out_dir = args.output_dir
     os.makedirs(out_dir, exist_ok=True)
     frames_dir = os.path.join(out_dir, "video_frames")
