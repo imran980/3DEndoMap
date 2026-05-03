@@ -234,7 +234,8 @@ def render_gps_frame(gps_data, current_idx, coverage_counts=None,
 # ---------- HUD ----------
 
 def draw_hud(panel, *, gps_w, elapsed_s, speed_mms, dist_mm, mode,
-             cov_pct=0.0, n_mesh_verts=0, n_fused=0):
+             cov_pct=0.0, n_mesh_verts=0, n_fused=0,
+             atlas_disclaimer=False):
     """Composite the per-frame HUD strip onto an already-rendered GPS panel."""
     hud_h = 74
     overlay = panel.copy()
@@ -279,3 +280,18 @@ def draw_hud(panel, *, gps_w, elapsed_s, speed_mms, dist_mm, mode,
         fill_x = int(bar_x1 + (bar_x2 - bar_x1) * cov_pct / 100.0)
         cv2.rectangle(panel, (bar_x1, bar_y),
                       (fill_x, bar_y + 10), c, -1)
+
+    if atlas_disclaimer:
+        # Subtle banner at the top-right of the panel: this airway shape
+        # is a generic atlas, not a patient-specific CT. The clinician
+        # MUST see this so they don't read sub-mm accuracy into it.
+        h, w = panel.shape[:2]
+        msg = "Atlas-based - approximate localization (not patient-specific)"
+        size, _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        x0 = w - size[0] - 16
+        y0 = h - 50
+        cv2.rectangle(panel, (x0 - 6, y0 - 14),
+                      (w - 8, y0 + 6), (40, 30, 30), -1)
+        cv2.putText(panel, msg, (x0, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (200, 200, 80), 1, cv2.LINE_AA)

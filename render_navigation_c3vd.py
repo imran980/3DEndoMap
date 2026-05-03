@@ -389,7 +389,9 @@ def run(args):
         draw_hud(gps_panel, gps_w=gps_w, elapsed_s=elapsed_s,
                  speed_mms=speed_mms, dist_mm=dist_mm,
                  mode=args.mode, cov_pct=cov_pct,
-                 n_mesh_verts=n_mesh, n_fused=n_fused)
+                 n_mesh_verts=n_mesh, n_fused=n_fused,
+                 atlas_disclaimer=bool(getattr(args, "atlas_disclaimer",
+                                               False)))
 
         # ---- composite ----
         canvas = np.zeros((vid_h, vid_w, 3), dtype=np.uint8)

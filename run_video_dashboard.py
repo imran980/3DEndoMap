@@ -142,6 +142,25 @@ def run(args):
     os.makedirs(out_dir, exist_ok=True)
     frames_dir = os.path.join(out_dir, "video_frames")
 
+    # ---- Atlas: build a procedural bronchial-tree mesh when the user
+    # didn't supply a patient-specific one, so the GPS panel always has
+    # an anatomically credible canvas. The trajectory ICP inside
+    # render_navigation_c3vd then snaps the camera path onto it.
+    using_atlas = False
+    if args.organ_mesh is None and args.atlas == "procedural":
+        from bronchus_atlas import write_atlas
+        atlas_path, branches = write_atlas(out_dir)
+        args.organ_mesh = atlas_path
+        using_atlas = True
+        print(f"[atlas] generated procedural bronchial tree: "
+              f"{len(branches)} branches -> {atlas_path}")
+        if args.mode == "dynamic":
+            # Atlas is most useful as a reveal canvas. Switch unless the
+            # user explicitly asked for the live TSDF mesh.
+            print("[atlas] --mode dynamic was set; keeping it because the "
+                  "atlas is informational only. Pass --mode reveal to "
+                  "paint the atlas in as the camera moves through it.")
+
     # 1. extract
     if args.reuse_frames and os.path.isdir(frames_dir) and \
             any(p.endswith("_color.png") for p in os.listdir(frames_dir)):
@@ -165,11 +184,17 @@ def run(args):
     else:
         print("Reusing existing pose.txt")
 
-    # 3. hand off to the standard dashboard
+    # If no organ mesh and no atlas, coverage / reveal aren't valid.
     if args.mode in ("coverage", "reveal") and not args.organ_mesh:
         print(f"WARNING: --mode {args.mode} requires --organ_mesh; "
               f"falling back to 'dynamic'.")
         args.mode = "dynamic"
+    # When using the atlas, default mode flips to reveal so the tree
+    # paints in as the camera moves through it (the cleanest demo).
+    if using_atlas and args.mode == "dynamic" and not args.force_dynamic:
+        print("[atlas] auto-switching --mode dynamic -> reveal "
+              "(use --force_dynamic to keep TSDF live mesh).")
+        args.mode = "reveal"
 
     dash_args = Namespace(
         c3vd_dir=frames_dir,
@@ -199,6 +224,7 @@ def run(args):
         tsdf_min_camera_motion_mm=args.tsdf_min_camera_motion_mm,
         tsdf_keep_top_components=args.tsdf_keep_top_components,
         tsdf_min_component_triangles=args.tsdf_min_component_triangles,
+        atlas_disclaimer=using_atlas,
     )
     if args.organ_mesh:
         dash_args.no_trajectory_align = False
@@ -215,7 +241,20 @@ if __name__ == "__main__":
                    choices=["coverage", "reveal", "dynamic"])
     p.add_argument("--organ_mesh", default=None,
                    help="Optional pre-op organ mesh (.ply/.obj) for "
-                        "coverage/reveal modes. Required if --mode != dynamic.")
+                        "coverage/reveal modes. If unset and --atlas is "
+                        "'procedural', a generic bronchial tree is generated "
+                        "and used as the GPS canvas (atlas-based, approximate).")
+    p.add_argument("--atlas", default="procedural",
+                   choices=["procedural", "none"],
+                   help="Generate a procedural bronchial-tree atlas as the "
+                        "GPS canvas when --organ_mesh isn't supplied. "
+                        "'none' disables this and uses the live TSDF mesh "
+                        "(--mode dynamic) instead.")
+    p.add_argument("--force_dynamic", action="store_true",
+                   help="When using the atlas, normally we auto-switch to "
+                        "--mode reveal. This flag keeps --mode dynamic "
+                        "(live TSDF mesh) on top of the atlas being "
+                        "saved separately to disk.")
     p.add_argument("--hfov", default=90.0, type=float,
                    help="Horizontal FOV (deg). Default 90 for bronchoscopes; "
                         "use 140 for colonoscopes.")
