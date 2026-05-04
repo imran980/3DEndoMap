@@ -29,20 +29,24 @@ hallucinated geometry is not.
 
 ## 2. Model stack
 
-| Job | Model | Why this one |
+| Job | Today | Target (after M1+M2) |
 |---|---|---|
-| **Per-frame depth** | **EndoDAC** (MICCAI 2024) | endoscopy-finetuned DepthAnything-vitb14 + DV-LoRA. Beats GT depth on C3VD ICP (0.66 vs 0.64). |
-| **Pose + Gaussian map** | **Endo-2DTAM** (2024) — primary | 2D Gaussians sit on surfaces (right inductive bias for tubular airways). Same author group as Endo-4DGS / EndoDAC. |
-| | **EndoGSLAM** — fallback | mature, well-tested 3D-Gaussian endoscopy SLAM. Used when Endo-2DTAM has issues. |
-| **Map fusion (today)** | Open3D **ScalableTSDFVolume** | classical, deterministic. Replaced by Endo-2DTAM's GS map in M2. |
-| **Normal-airway prior (M4)** | **PointNet++ / DeepSDF** trained on ATM'22 | learned shape distribution of healthy bronchi. |
-| **Comparison metric (M5)** | per-vertex Hausdorff + per-branch diameter ratios + topology graph | explainable to a clinician, not a black-box score. |
-| **Segmentation (M8, optional)** | **SAM2** + lesion / tool / blood heads | per-pixel masks back-projected onto the 3D map. |
-| **Confidence (M9, optional)** | TTA std-dev (depth) + temperature-scaled logits (seg) + voxel-weight thresholds (TSDF) | every overlay carries an uncertainty channel. |
+| **Camera tracking** | ORB+RANSAC VO (`pose_estimation.py`) — drifts, but zero deps; kept long-term as a fallback | **Endo-2DTAM** |
+| **Per-frame depth** | **EndoDAC** via `depth_backbones.py` | **Endo-2DTAM internal depth** (EndoDAC retired) |
+| **3D map** | Open3D TSDF (`dynamic_organ.py`) | **Endo-2DTAM 2D-Gaussian map** (TSDF retired) |
+| **GPS canvas** | procedural bronchial atlas (`bronchus_atlas.py`) | same — atlas-based, approximate; HUD discloses it |
+| **Normal-airway prior (M4)** | — | **PointNet++ / DeepSDF** trained on ATM'22 |
+| **Comparison metric (M5)** | — | per-vertex Hausdorff + per-branch diameter + topology graph |
+| **Segmentation (M7)** | — | **SAM2** + lesion / tool / blood heads |
+| **Confidence (M8)** | — | TTA std-dev (depth) + temperature-scaled logits (seg) + voxel weights |
 
-Removed from the stack: **ORB+RANSAC VO** (placeholder, drifts),
-**NRGS-SLAM** (deformable — overkill for rigid airways), legacy
-Endo-4DGS dashboard, C3VD-only references in the main flow.
+Why two columns: today's column is the **working pipeline you can
+run right now**; the target column is what the codebase converges to
+once Endo-2DTAM is integrated, at which point we drop the depth +
+TSDF stack (see the simplification gate in §4).
+
+Removed from the plan entirely: **NRGS-SLAM** (deformable — overkill
+for rigid airways), legacy Endo-4DGS dashboard.
 
 ---
 
@@ -93,6 +97,39 @@ M6 → M7 + M8 in parallel → M9. M3 happens in the dataset workstream.
 | M7 | new `seg_backbones.py` + `dashboard_common.py` |
 | M8 | new `confidence.py` + `dashboard_common.py` |
 | M9 | new `clinical_ui/` |
+
+### Simplification gate — files slated for removal once M1+M2 land
+
+Endo-2DTAM produces tracking, a 3D Gaussian map, **and** internal
+depth reasoning, so once it's working the depth+TSDF stack becomes
+redundant. The cleanup commit happens **after** Endo-2DTAM is
+verified end-to-end on a real bronchoscopy video; until then these
+files stay as the working fallback path.
+
+| File | Why it leaves | Replacement |
+|---|---|---|
+| `dav2_depth.py` | DAv2 wrapper — no longer needed for fusion or the depth panel | Endo-2DTAM internal depth |
+| `depth_backbones.py` (EndoDAC + DAv2) | depth backbone abstraction is irrelevant once the SLAM provides depth | Endo-2DTAM |
+| `dynamic_organ.py` (TSDF fusion + cleanup) | TSDF map replaced by 2D-Gaussian map | Endo-2DTAM `.ply` |
+| `build_colon_from_c3vd.py` | C3VD-only TSDF utility | — (regression-test path drops to one script) |
+| `build_colon_from_dav2.py` | learned-depth + GT-pose TSDF | — |
+| `prepare_c3vd.py` | C3VD-specific dataset prep | kept only if we still want a regression test |
+| Calibration plumbing inside `render_navigation_c3vd.py` (`a_avg`, `b_avg`, `assumed_median_depth_mm`, GT-depth pairing) | depth no longer needs per-frame mm anchoring | — |
+
+**Kept as-is** (small core that stays valuable):
+
+| File | Why it stays |
+|---|---|
+| `run_video_dashboard.py` | end-to-end entry point |
+| `tracking_backends.py` | the abstraction, with Endo-2DTAM as the one backend (and ORB kept as the zero-dep fallback) |
+| `pose_estimation.py` | the ORB fallback — runs in any env, no extra deps |
+| `bronchus_atlas.py` | procedural GPS canvas |
+| `dashboard_common.py` | panels / HUD / GPS rendering |
+| `render_navigation_c3vd.py` | orchestrator — trimmed by ~40% after the cleanup |
+| `check_alignment.py` | useful debug utility |
+
+After the simplification: ~1500 LOC removed, single conda env
+(no EndoDAC env needed), and no dual-pipeline maintenance burden.
 
 ---
 
