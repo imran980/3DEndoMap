@@ -202,8 +202,34 @@ def run(args):
                   f"{assumed:.1f} mm) -> a={a_avg:.2f}, b=0.")
 
     # ---- TSDF (dynamic mode) ----
+    # When the tracker already produced a 3D map (e.g. Endo-2DTAM's
+    # 2D Gaussian map saved as a .ply), skip TSDF entirely and load
+    # that as the organ mesh instead.
     organ_builder = None
-    if args.mode == "dynamic":
+    prebuilt = getattr(args, "prebuilt_gs_map", None)
+    if prebuilt and os.path.isfile(prebuilt) and args.mode == "dynamic":
+        print(f"Using pre-built tracker map (skipping TSDF): {prebuilt}")
+        try:
+            premesh = o3d.io.read_triangle_mesh(prebuilt)
+            premesh.compute_vertex_normals()
+            if len(premesh.vertices) > 0:
+                organ_pts = np.asarray(premesh.vertices, dtype=np.float64)
+                if gps_data is None:
+                    gps_data = {}
+                gps_data['organ_pts'] = organ_pts
+                gps_data['centerline'] = compute_organ_centerline(
+                    premesh, n_points=200)
+                gps_data['center'] = organ_pts.mean(axis=0)
+                gps_data['extent'] = (
+                    organ_pts.max(axis=0) - organ_pts.min(axis=0))
+                gps_data.setdefault('elev', 25)
+                gps_data.setdefault('azim', 45)
+                gps_data.setdefault('n_frames', n)
+        except Exception as e:
+            print(f"WARNING: failed to load pre-built map ({e}); "
+                  f"falling back to TSDF.")
+            prebuilt = None
+    if args.mode == "dynamic" and not prebuilt:
         organ_builder = DynamicOrganBuilder(
             voxel_size=args.voxel_size,
             depth_trunc=args.depth_trunc,

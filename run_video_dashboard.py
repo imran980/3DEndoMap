@@ -39,6 +39,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pose_estimation import MonocularVO, write_pose_txt
+from tracking_backends import make_tracking_backend
 import render_navigation_c3vd as rnc
 
 
@@ -71,29 +72,47 @@ def extract_frames(video_path, frames_dir, max_frames=None, skip_every=1):
     return written, fps
 
 
-def estimate_poses(frames_dir, hfov_deg):
+def estimate_poses(frames_dir, hfov_deg, tracking="orb", output_dir=None,
+                   endo2dtam_repo=None, endo2dtam_checkpoints=None):
+    """Run a tracking backend over the frames in `frames_dir`.
+
+    Returns (pose_path, image_hw, gs_map_path).
+    """
     paths = sorted(p for p in os.listdir(frames_dir)
                    if p.endswith("_color.png"))
     if len(paths) < 2:
-        sys.exit("ERROR: need at least 2 frames for VO.")
+        sys.exit("ERROR: need at least 2 frames for tracking.")
 
     sample = cv2.imread(os.path.join(frames_dir, paths[0]))
     H, W = sample.shape[:2]
-    vo = MonocularVO(hfov_deg=hfov_deg, image_hw=(H, W))
 
-    print(f"Loading {len(paths)} frames into memory for VO ({W}x{H})...")
+    print(f"Loading {len(paths)} frames into memory for tracking ({W}x{H})...")
     frames = []
     for p in tqdm(paths, desc="Reading"):
         bgr = cv2.imread(os.path.join(frames_dir, p))
         frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
-    print("Running monocular VO (ORB + RANSAC)...")
-    poses = vo.estimate(frames)
+    if tracking == "orb":
+        bb = make_tracking_backend("orb")
+    elif tracking == "endo2dtam":
+        if not endo2dtam_repo:
+            sys.exit("ERROR: --tracking endo2dtam requires --endo2dtam_repo.")
+        bb = make_tracking_backend(
+            "endo2dtam",
+            repo_dir=endo2dtam_repo,
+            checkpoint_dir=endo2dtam_checkpoints,
+        )
+    else:
+        sys.exit(f"Unknown --tracking value: {tracking}")
+
+    print(f"Running tracking backend ({bb.name})...")
+    result = bb.run(frames, hfov_deg=hfov_deg, output_dir=output_dir)
+    print(f"Tracking result: {result.n_frames} poses ({result.note})")
 
     pose_path = os.path.join(frames_dir, "pose.txt")
-    write_pose_txt(poses, pose_path)
-    print(f"Wrote {len(poses)} poses -> {pose_path}")
-    return pose_path, (H, W)
+    write_pose_txt(result.poses, pose_path)
+    print(f"Wrote {len(result.poses)} poses -> {pose_path}")
+    return pose_path, (H, W), result.gs_map_path
 
 
 def _resolve_endodac_paths(args):
@@ -174,13 +193,21 @@ def run(args):
         print(f"Wrote {n} frames -> {frames_dir}")
 
     # 2. poses (skip if user supplied a pose.txt)
+    gs_map_path = None
     if args.poses_file:
         shutil.copy2(args.poses_file,
                      os.path.join(frames_dir, "pose.txt"))
         print(f"Using user-provided poses: {args.poses_file}")
     elif not (args.reuse_frames
               and os.path.isfile(os.path.join(frames_dir, "pose.txt"))):
-        estimate_poses(frames_dir, hfov_deg=args.hfov)
+        _, _, gs_map_path = estimate_poses(
+            frames_dir, hfov_deg=args.hfov,
+            tracking=args.tracking, output_dir=out_dir,
+            endo2dtam_repo=args.endo2dtam_repo,
+            endo2dtam_checkpoints=args.endo2dtam_checkpoints,
+        )
+        if gs_map_path:
+            print(f"Tracker also produced a 3D map: {gs_map_path}")
     else:
         print("Reusing existing pose.txt")
 
@@ -225,6 +252,7 @@ def run(args):
         tsdf_keep_top_components=args.tsdf_keep_top_components,
         tsdf_min_component_triangles=args.tsdf_min_component_triangles,
         atlas_disclaimer=using_atlas,
+        prebuilt_gs_map=gs_map_path,
     )
     if args.organ_mesh:
         dash_args.no_trajectory_align = False
@@ -269,6 +297,20 @@ if __name__ == "__main__":
                    help="Skip VO and use this pre-computed pose.txt.")
 
     # Depth backbone (forwarded)
+    # Tracking backend
+    p.add_argument("--tracking", default="orb",
+                   choices=["orb", "endo2dtam"],
+                   help="Camera-tracking backend. 'orb' = always-works "
+                        "ORB+RANSAC VO (drifts on long clips). "
+                        "'endo2dtam' = SOTA endoscopic Gaussian-SLAM, "
+                        "requires --endo2dtam_repo + checkpoints.")
+    p.add_argument("--endo2dtam_repo", default=None,
+                   help="Path to a local clone of "
+                        "https://github.com/lastbasket/Endo-2DTAM")
+    p.add_argument("--endo2dtam_checkpoints", default=None,
+                   help="Path to Endo-2DTAM checkpoint folder.")
+
+    # Depth backbone
     p.add_argument("--backbone", default="endodac",
                    choices=["dav2", "endodac"])
     p.add_argument("--variant", default="vitb")
