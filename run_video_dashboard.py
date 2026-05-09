@@ -226,6 +226,7 @@ def run(args):
         device=args.device,
         num_iters_tracking=args.endo2dtam_tracking_iters,
         num_iters_mapping=args.endo2dtam_mapping_iters,
+        cleanup=not args.keep_endo2dtam_artifacts,
     )
     pose_path = os.path.join(frames_dir, "pose.txt")
     write_pose_txt(poses, pose_path)
@@ -293,6 +294,12 @@ if __name__ == "__main__":
                         "https://github.com/lastbasket/Endo-2DTAM")
     p.add_argument("--endo2dtam_tracking_iters", default=15, type=int)
     p.add_argument("--endo2dtam_mapping_iters", default=15, type=int)
+    p.add_argument("--keep_endo2dtam_artifacts", action="store_true",
+                   help="Keep the staged input dataset and the full Endo-"
+                        "2DTAM run dir (params.npz, checkpoints) on disk "
+                        "after the run. Default: clean them up to free "
+                        "multi-GB per invocation; the GS-map .ply is "
+                        "always preserved next to output_dir.")
     p.add_argument("--device", default="cuda:0")
 
     # Depth backbone

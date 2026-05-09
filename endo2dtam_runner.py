@@ -264,7 +264,8 @@ def run_endo2dtam(frames: List[np.ndarray],
                   output_dir: str,
                   device: str = "cuda:0",
                   num_iters_tracking: int = 15,
-                  num_iters_mapping: int = 15
+                  num_iters_mapping: int = 15,
+                  cleanup: bool = True,
                   ) -> Tuple[List[np.ndarray], Optional[str], str]:
     """End-to-end: stage data, call rgbd_slam, return poses + gs_map_path.
 
@@ -321,4 +322,35 @@ def run_endo2dtam(frames: List[np.ndarray],
     poses, gs_ply = _read_outputs(workdir, seq_name)
     run_dir = os.path.join(workdir, seq_name)
     print(f"[endo2dtam] {len(poses)} poses; gs map: {gs_ply}")
+
+    # ---- Disk cleanup ----------------------------------------------------
+    # Endo-2DTAM stages a full RGB+depth copy under <repo>/data/<seq> and
+    # writes large checkpoints (params.npz, means3D.npy) under <workdir>/
+    # <seq>. Once we've extracted poses + the GS map .ply, the rest is
+    # dead weight — multi-GB per run, will fill the disk fast on repeat
+    # invocations. Move the .ply out, delete the rest.
+    if cleanup:
+        import shutil
+        # 1. Drop the staged input dataset (color/, depth/, pose.txt, yaml)
+        staged = os.path.join(endo2dtam_repo, "data", seq_name)
+        if os.path.isdir(staged):
+            shutil.rmtree(staged, ignore_errors=True)
+            print(f"[endo2dtam] cleaned staged input: {staged}")
+        # 2. Move the GS map .ply up one level so we can drop run_dir
+        new_gs_ply = None
+        if gs_ply and os.path.isfile(gs_ply):
+            new_gs_ply = os.path.join(workdir, f"{seq_name}_gs_map.ply")
+            try:
+                shutil.move(gs_ply, new_gs_ply)
+                gs_ply = new_gs_ply
+            except Exception as e:
+                print(f"[endo2dtam] couldn't relocate gs_map ({e}); "
+                      f"keeping run_dir.")
+                new_gs_ply = None
+        # 3. Drop the entire run dir (checkpoints, eval, params.npz, etc.)
+        if new_gs_ply is not None and os.path.isdir(run_dir):
+            shutil.rmtree(run_dir, ignore_errors=True)
+            print(f"[endo2dtam] cleaned run dir: {run_dir}")
+            run_dir = workdir   # caller doesn't index into run_dir, just stores it
+
     return poses, gs_ply, run_dir
