@@ -23,7 +23,7 @@ runs from RGB-only video. Treat it as a baseline to be replaced
 with Endo-2DTAM once integrated.
 """
 
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence  # noqa: F401
 import numpy as np
 import cv2
 
@@ -140,13 +140,34 @@ class MonocularVO:
 
 
 def write_pose_txt(poses: Sequence[np.ndarray], path: str) -> None:
-    """Save 4x4 c2w matrices in C3VD format (16 floats per line, row-major
-    BUT subsequently transposed by parse_c3vd_poses — match the upstream
-    convention by writing the matrix transposed).
+    """Save 4x4 c2w matrices as 16 floats per line.
+
+    The matrix is *transposed* before flattening so that
+    parse_pose_txt() (which reshapes 16 floats then .T) round-trips.
     """
     with open(path, "w") as f:
         for p in poses:
-            # parse_c3vd_poses() does reshape(4,4).T, so to round-trip we
-            # need to write the *transpose* row-by-row.
             flat = p.T.reshape(-1).tolist()
             f.write(" ".join(f"{v:.8f}" for v in flat) + "\n")
+
+
+def parse_pose_txt(path: str) -> List[np.ndarray]:
+    """Inverse of write_pose_txt — read 4x4 c2w matrices from a text file.
+
+    Each line: 16 floats. Lines with 12 floats are also accepted (the
+    last row is assumed to be [0,0,0,1]).
+    """
+    poses = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            vals = [float(v) for v in line.replace(",", " ").split()]
+            if len(vals) == 16:
+                poses.append(np.array(vals).reshape(4, 4).T)
+            elif len(vals) == 12:
+                m = np.eye(4)
+                m[:3, :] = np.array(vals).reshape(3, 4)
+                poses.append(m)
+    return poses

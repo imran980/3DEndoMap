@@ -1,1 +1,0 @@
-python metrics.py --model_path output/endonerf/pulling

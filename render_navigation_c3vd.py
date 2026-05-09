@@ -39,9 +39,22 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from prepare_c3vd import parse_c3vd_poses
-from build_colon_from_c3vd import _find_pairs, _pose_to_organ_space
+from pose_estimation import parse_pose_txt
 from dav2_depth import fit_disparity_to_depth, disparity_to_depth
+
+
+def _find_color_frames(c3vd_dir):
+    """Return a sorted list of RGB frame paths under c3vd_dir.
+
+    Accepts both `<dir>/NNNN_color.png` (run_video_dashboard layout)
+    and `<dir>/rgb/NNNN_color.png` (legacy).
+    """
+    candidates = (
+        sorted(glob.glob(os.path.join(c3vd_dir, "*_color.png")))
+        or sorted(glob.glob(os.path.join(c3vd_dir, "rgb", "*_color.png")))
+        or sorted(glob.glob(os.path.join(c3vd_dir, "*.png")))
+    )
+    return candidates
 from depth_backbones import make_backbone
 from dynamic_organ import DynamicOrganBuilder
 from dashboard_common import (
@@ -93,20 +106,16 @@ def _align_trajectory_to_organ(cam_positions, centerline, max_corr=80.0):
 def run(args):
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ---- Load RGB+depth pairs and poses ----
-    pairs_with_gt = _find_pairs(args.c3vd_dir)
-    rgbs_alone = sorted(glob.glob(os.path.join(args.c3vd_dir, "*_color.png"))) \
-        or sorted(glob.glob(os.path.join(args.c3vd_dir, "rgb", "*_color.png"))) \
-        or sorted(glob.glob(os.path.join(args.c3vd_dir, "*.png")))
-    rgb_paths = [p[0] for p in pairs_with_gt] if pairs_with_gt else rgbs_alone
-    gt_depth_paths = ([p[1] for p in pairs_with_gt]
-                      if pairs_with_gt else [None] * len(rgb_paths))
+    # ---- Load RGB frames and poses ----
+    # Bronchoscopy video flow has no GT depth files alongside the
+    # frames; the calibration block below handles that fallback.
+    rgb_paths = _find_color_frames(args.c3vd_dir)
+    gt_depth_paths = [None] * len(rgb_paths)
 
     pose_path = os.path.join(args.c3vd_dir, "pose.txt")
     if not os.path.exists(pose_path):
         sys.exit(f"ERROR: missing {pose_path}")
-    poses = parse_c3vd_poses(pose_path)
-    poses = [_pose_to_organ_space(p) for p in poses]
+    poses = parse_pose_txt(pose_path)
 
     n = min(len(rgb_paths), len(poses))
     rgb_paths, gt_depth_paths, poses = (rgb_paths[:n], gt_depth_paths[:n],
