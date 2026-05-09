@@ -225,8 +225,15 @@ def render_gps_frame(gps_data, current_idx, coverage_counts=None,
 
     fig.canvas.draw()
     w, h = fig.canvas.get_width_height()
-    buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8) \
-        .reshape(h, w, 3)
+    # Matplotlib >= 3.8 removed tostring_rgb(); use buffer_rgba() and
+    # drop the alpha channel. Falls back to tostring_rgb() on older
+    # builds.
+    if hasattr(fig.canvas, "buffer_rgba"):
+        buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8) \
+            .reshape(h, w, 4)[..., :3].copy()
+    else:
+        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8) \
+            .reshape(h, w, 3)
     plt.close(fig)
     return buf
 
