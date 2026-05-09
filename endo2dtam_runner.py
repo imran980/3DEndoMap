@@ -212,13 +212,25 @@ def _read_outputs(workdir: str, run_name: str
     npz = np.load(params_path, allow_pickle=True)
     keys = npz.files
     if "cam_unnorm_rots" in keys and "cam_trans" in keys:
-        rots = np.asarray(npz["cam_unnorm_rots"])     # (4, 1, T) typically
-        trs = np.asarray(npz["cam_trans"])            # (3, 1, T)
-        # Squeeze the singleton middle dim if present.
-        if rots.ndim == 3:
-            rots = np.squeeze(rots, axis=1).T         # (T, 4)
-        if trs.ndim == 3:
-            trs = np.squeeze(trs, axis=1).T           # (T, 3)
+        rots = np.asarray(npz["cam_unnorm_rots"])
+        trs = np.asarray(npz["cam_trans"])
+        # Endo-2DTAM stores cam_unnorm_rots/cam_trans in shapes that
+        # vary slightly across releases: (4, 1, T), (4, T), (T, 4), or
+        # nested. Normalize to (T, 4) and (T, 3) by inspection.
+        rots = np.squeeze(rots)
+        trs = np.squeeze(trs)
+        if rots.ndim == 2 and rots.shape[0] == 4 and rots.shape[1] != 4:
+            rots = rots.T
+        if trs.ndim == 2 and trs.shape[0] == 3 and trs.shape[1] != 3:
+            trs = trs.T
+        if rots.ndim != 2 or rots.shape[1] != 4:
+            raise RuntimeError(
+                f"Unexpected cam_unnorm_rots shape after squeeze: "
+                f"{rots.shape}. Update _read_outputs() to match.")
+        if trs.ndim != 2 or trs.shape[1] != 3:
+            raise RuntimeError(
+                f"Unexpected cam_trans shape after squeeze: {trs.shape}. "
+                f"Update _read_outputs() to match.")
         rots = rots / np.linalg.norm(rots, axis=1, keepdims=True)
 
         from scipy.spatial.transform import Rotation as R
