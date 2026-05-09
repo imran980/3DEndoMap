@@ -39,7 +39,22 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pose_estimation import parse_pose_txt
+def parse_pose_txt(path):
+    """Read 4x4 c2w matrices from a text file (16 floats per line)."""
+    poses = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            vals = [float(v) for v in line.replace(",", " ").split()]
+            if len(vals) == 16:
+                poses.append(np.array(vals).reshape(4, 4).T)
+            elif len(vals) == 12:
+                m = np.eye(4)
+                m[:3, :] = np.array(vals).reshape(3, 4)
+                poses.append(m)
+    return poses
 from dav2_depth import fit_disparity_to_depth, disparity_to_depth
 
 
@@ -56,7 +71,6 @@ def _find_color_frames(c3vd_dir):
     )
     return candidates
 from depth_backbones import make_backbone
-from dynamic_organ import DynamicOrganBuilder
 from dashboard_common import (
     depth_to_colormap, frustum_visibility, compute_organ_centerline,
     render_gps_frame, draw_hud,
@@ -235,24 +249,15 @@ def run(args):
                 gps_data.setdefault('azim', 45)
                 gps_data.setdefault('n_frames', n)
         except Exception as e:
-            print(f"WARNING: failed to load pre-built map ({e}); "
-                  f"falling back to TSDF.")
-            prebuilt = None
-    if args.mode == "dynamic" and not prebuilt:
-        organ_builder = DynamicOrganBuilder(
-            voxel_size=args.voxel_size,
-            depth_trunc=args.depth_trunc,
-            depth_min=args.tsdf_depth_min,
-            edge_margin_pct=args.tsdf_edge_margin_pct,
-            grad_thresh=args.tsdf_grad_thresh,
-            min_camera_motion_mm=args.tsdf_min_camera_motion_mm,
-            mesh_cleanup_keep_top=args.tsdf_keep_top_components,
-            mesh_cleanup_min_triangles=args.tsdf_min_component_triangles,
-        )
-        print(f"TSDF: voxel={args.voxel_size} mm, depth=["
-              f"{args.tsdf_depth_min:.1f}, {args.depth_trunc:.1f}] mm, "
-              f"motion gate={args.tsdf_min_camera_motion_mm:.2f} mm, "
-              f"keep top {args.tsdf_keep_top_components} components")
+            sys.exit(f"ERROR: failed to load Endo-2DTAM map "
+                     f"({prebuilt}): {e}")
+    elif args.mode == "dynamic":
+        sys.exit(
+            "ERROR: --mode dynamic requires a pre-built Gaussian map "
+            "(prebuilt_gs_map). run_video_dashboard.py wires this up "
+            "automatically via Endo-2DTAM; if you're calling "
+            "render_navigation_c3vd directly, use --mode reveal with "
+            "--organ_mesh instead.")
 
     # ---- GPS scene data ----
     if organ_mesh is not None:
@@ -359,20 +364,7 @@ def run(args):
         if args.depth_smooth_ksize >= 3:
             depth_mm = cv2.medianBlur(depth_mm, args.depth_smooth_ksize)
 
-        # ---- TSDF integrate (dynamic mode only) ----
-        if organ_builder is not None and np.any(depth_mm > 0):
-            w2c = np.linalg.inv(poses[idx]).astype(np.float64)
-            organ_builder.integrate(rgb, depth_mm, w2c, intrinsic)
-            if (idx % args.mesh_update_every == 0) or (idx == n - 1):
-                mesh = organ_builder.extract_mesh()
-                if mesh is not None:
-                    new_pts = np.asarray(mesh.vertices)
-                    gps_data['organ_pts'] = new_pts
-                    gps_data['sub_idx'] = None
-                    combined = np.vstack([new_pts, cam_positions])
-                    gps_data['center'] = combined.mean(axis=0)
-                    gps_data['extent'] = (combined.max(0) - combined.min(0)
-                                          + 10.0)
+        # (no online TSDF — the GS map is pre-built by Endo-2DTAM)
 
         # ---- coverage update ----
         if seen_any is not None:
@@ -420,7 +412,7 @@ def run(args):
         cov_pct = (float(seen_any.sum()) / max(len(gps_data['organ_pts']), 1)
                    * 100.0 if seen_any is not None else 0.0)
         n_mesh = len(gps_data['organ_pts']) if args.mode == "dynamic" else 0
-        n_fused = organ_builder.n_integrated if organ_builder else 0
+        n_fused = len(gps_data['organ_pts']) if args.mode == "dynamic" else 0
         draw_hud(gps_panel, gps_w=gps_w, elapsed_s=elapsed_s,
                  speed_mms=speed_mms, dist_mm=dist_mm,
                  mode=args.mode, cov_pct=cov_pct,
@@ -443,12 +435,8 @@ def run(args):
     writer.release()
     print(f"Wrote: {video_path}")
 
-    if organ_builder is not None:
-        mesh = organ_builder.extract_mesh(min_vertices=0)
-        if mesh is not None and len(mesh.vertices) > 0:
-            mp = os.path.join(args.output_dir, "dynamic_organ_mesh.ply")
-            o3d.io.write_triangle_mesh(mp, mesh)
-            print(f"Final mesh: {mp} ({len(mesh.vertices):,} verts)")
+    # No final-mesh write here — Endo-2DTAM already wrote the
+    # 2D-Gaussian map (endo2dtam_gs_map.ply) into its own run dir.
 
 
 if __name__ == "__main__":
@@ -481,26 +469,6 @@ if __name__ == "__main__":
     p.add_argument("--voxel_size", default=0.5, type=float,
                    help="TSDF voxel size mm (dynamic mode)")
     p.add_argument("--mesh_update_every", default=15, type=int)
-    # --- TSDF cleanup knobs (dynamic mode) ---
-    p.add_argument("--tsdf_depth_min", default=5.0, type=float,
-                   help="Drop TSDF depth pixels closer than this (mm). "
-                        "Bumped from the legacy 0.5 because near-camera "
-                        "pixels at slow motion smear into a center blob.")
-    p.add_argument("--tsdf_edge_margin_pct", default=4.0, type=float,
-                   help="Drop TSDF depth pixels within N%% of the image "
-                        "edge (lens vignette / distortion).")
-    p.add_argument("--tsdf_grad_thresh", default=8.0, type=float,
-                   help="Drop TSDF depth pixels with steep local gradient "
-                        "(scaled by median depth). 0 = disable.")
-    p.add_argument("--tsdf_min_camera_motion_mm", default=0.5, type=float,
-                   help="Skip integrating a frame if the camera moved less "
-                        "than this from the last integration. Prevents "
-                        "blob accumulation when the scope hovers.")
-    p.add_argument("--tsdf_keep_top_components", default=3, type=int,
-                   help="After mesh extraction, keep only the N largest "
-                        "connected components. 0 = no cleanup.")
-    p.add_argument("--tsdf_min_component_triangles", default=200, type=int,
-                   help="Minimum triangles for a kept connected component.")
     p.add_argument("--no_trajectory_align", action="store_true",
                    help="Skip the trajectory->centerline ICP (default: on). "
                         "Disable only if you've already aligned poses.")
