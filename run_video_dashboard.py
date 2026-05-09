@@ -73,7 +73,8 @@ def extract_frames(video_path, frames_dir, max_frames=None, skip_every=1):
 
 
 def estimate_poses(frames_dir, hfov_deg, tracking="orb", output_dir=None,
-                   endo2dtam_repo=None, endo2dtam_checkpoints=None):
+                   endo2dtam_repo=None, endo2dtam_checkpoints=None,
+                   endo2dtam_python=None, depth_backbone=None):
     """Run a tracking backend over the frames in `frames_dir`.
 
     Returns (pose_path, image_hw, gs_map_path).
@@ -101,12 +102,15 @@ def estimate_poses(frames_dir, hfov_deg, tracking="orb", output_dir=None,
             "endo2dtam",
             repo_dir=endo2dtam_repo,
             checkpoint_dir=endo2dtam_checkpoints,
+            python_bin=endo2dtam_python,
         )
     else:
         sys.exit(f"Unknown --tracking value: {tracking}")
 
     print(f"Running tracking backend ({bb.name})...")
-    result = bb.run(frames, hfov_deg=hfov_deg, output_dir=output_dir)
+    result = bb.run(frames, hfov_deg=hfov_deg,
+                    depth_backbone=depth_backbone,
+                    output_dir=output_dir)
     print(f"Tracking result: {result.n_frames} poses ({result.note})")
 
     pose_path = os.path.join(frames_dir, "pose.txt")
@@ -200,11 +204,23 @@ def run(args):
         print(f"Using user-provided poses: {args.poses_file}")
     elif not (args.reuse_frames
               and os.path.isfile(os.path.join(frames_dir, "pose.txt"))):
+        depth_bb = None
+        if args.tracking == "endo2dtam":
+            from depth_backbones import make_backbone
+            if args.backbone == "endodac":
+                depth_bb = make_backbone(
+                    "endodac",
+                    repo_dir=args.endodac_repo,
+                    weights_path=args.endodac_weights)
+            else:
+                depth_bb = make_backbone("dav2", variant=args.variant)
         _, _, gs_map_path = estimate_poses(
             frames_dir, hfov_deg=args.hfov,
             tracking=args.tracking, output_dir=out_dir,
             endo2dtam_repo=args.endo2dtam_repo,
             endo2dtam_checkpoints=args.endo2dtam_checkpoints,
+            endo2dtam_python=args.endo2dtam_python,
+            depth_backbone=depth_bb,
         )
         if gs_map_path:
             print(f"Tracker also produced a 3D map: {gs_map_path}")
@@ -308,7 +324,12 @@ if __name__ == "__main__":
                    help="Path to a local clone of "
                         "https://github.com/lastbasket/Endo-2DTAM")
     p.add_argument("--endo2dtam_checkpoints", default=None,
-                   help="Path to Endo-2DTAM checkpoint folder.")
+                   help="(unused — Endo-2DTAM is a per-sequence optimizer, "
+                        "not a pretrained model. Kept for compatibility.)")
+    p.add_argument("--endo2dtam_python", default=None,
+                   help="Path to the python interpreter inside the "
+                        "endo2dtam conda env (since their pins conflict "
+                        "with our env). Default: current interpreter.")
 
     # Depth backbone
     p.add_argument("--backbone", default="endodac",
