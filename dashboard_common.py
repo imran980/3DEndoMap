@@ -90,6 +90,7 @@ def compute_organ_centerline(organ_mesh, n_points=200):
 
 def render_gps_frame(gps_data, current_idx, coverage_counts=None,
                      reveal_mode=False, cam_pos=None, cam_forward=None,
+                     cam_trajectory=None,
                      width=640, height=480, dpi=100):
     """3D matplotlib GPS view — see render_navigation.py for full docs."""
     fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi)
@@ -173,6 +174,25 @@ def render_gps_frame(gps_data, current_idx, coverage_counts=None,
         ax.add_collection3d(Line3DCollection(segments, colors=colors,
                                              linewidths=2.0))
 
+    # Actual camera trajectory up to the current frame, drawn as a
+    # cyan polyline on top of the centerline. This is the observed
+    # path (whether from GT poses, SLAM, or VO), distinct from the
+    # PCA-derived centerline of the organ.
+    if cam_trajectory is not None and len(cam_trajectory) > 1:
+        traj = np.asarray(cam_trajectory)
+        upto = min(int(current_idx) + 1, len(traj))
+        if upto >= 2:
+            traj_segments = [
+                [traj[i], traj[i + 1]] for i in range(upto - 1)
+            ]
+            ax.add_collection3d(Line3DCollection(
+                traj_segments,
+                colors=[(0.30, 0.85, 0.95, 0.9)] * len(traj_segments),
+                linewidths=1.6))
+            # Faint dot at the trajectory start so it's always visible
+            ax.scatter(*traj[0], c=(0.30, 0.85, 0.95), s=80, zorder=8,
+                       depthshade=False)
+
     ax.scatter(*cur_pos, c='lime', s=360, zorder=10, edgecolors='white',
                linewidths=2.5, depthshade=False)
     if n_cl > 1:
@@ -205,8 +225,15 @@ def render_gps_frame(gps_data, current_idx, coverage_counts=None,
 
     fig.canvas.draw()
     w, h = fig.canvas.get_width_height()
-    buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8) \
-        .reshape(h, w, 3)
+    # Matplotlib >= 3.8 removed tostring_rgb(); use buffer_rgba() and
+    # drop the alpha channel. Falls back to tostring_rgb() on older
+    # builds.
+    if hasattr(fig.canvas, "buffer_rgba"):
+        buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8) \
+            .reshape(h, w, 4)[..., :3].copy()
+    else:
+        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8) \
+            .reshape(h, w, 3)
     plt.close(fig)
     return buf
 
@@ -214,7 +241,8 @@ def render_gps_frame(gps_data, current_idx, coverage_counts=None,
 # ---------- HUD ----------
 
 def draw_hud(panel, *, gps_w, elapsed_s, speed_mms, dist_mm, mode,
-             cov_pct=0.0, n_mesh_verts=0, n_fused=0):
+             cov_pct=0.0, n_mesh_verts=0, n_fused=0,
+             atlas_disclaimer=False):
     """Composite the per-frame HUD strip onto an already-rendered GPS panel."""
     hud_h = 74
     overlay = panel.copy()
@@ -259,3 +287,18 @@ def draw_hud(panel, *, gps_w, elapsed_s, speed_mms, dist_mm, mode,
         fill_x = int(bar_x1 + (bar_x2 - bar_x1) * cov_pct / 100.0)
         cv2.rectangle(panel, (bar_x1, bar_y),
                       (fill_x, bar_y + 10), c, -1)
+
+    if atlas_disclaimer:
+        # Subtle banner at the top-right of the panel: this airway shape
+        # is a generic atlas, not a patient-specific CT. The clinician
+        # MUST see this so they don't read sub-mm accuracy into it.
+        h, w = panel.shape[:2]
+        msg = "Atlas-based - approximate localization (not patient-specific)"
+        size, _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        x0 = w - size[0] - 16
+        y0 = h - 50
+        cv2.rectangle(panel, (x0 - 6, y0 - 14),
+                      (w - 8, y0 + 6), (40, 30, 30), -1)
+        cv2.putText(panel, msg, (x0, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (200, 200, 80), 1, cv2.LINE_AA)

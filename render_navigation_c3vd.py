@@ -39,11 +39,38 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from prepare_c3vd import parse_c3vd_poses
-from build_colon_from_c3vd import _find_pairs, _pose_to_organ_space
+def parse_pose_txt(path):
+    """Read 4x4 c2w matrices from a text file (16 floats per line)."""
+    poses = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            vals = [float(v) for v in line.replace(",", " ").split()]
+            if len(vals) == 16:
+                poses.append(np.array(vals).reshape(4, 4).T)
+            elif len(vals) == 12:
+                m = np.eye(4)
+                m[:3, :] = np.array(vals).reshape(3, 4)
+                poses.append(m)
+    return poses
 from dav2_depth import fit_disparity_to_depth, disparity_to_depth
+
+
+def _find_color_frames(c3vd_dir):
+    """Return a sorted list of RGB frame paths under c3vd_dir.
+
+    Accepts both `<dir>/NNNN_color.png` (run_video_dashboard layout)
+    and `<dir>/rgb/NNNN_color.png` (legacy).
+    """
+    candidates = (
+        sorted(glob.glob(os.path.join(c3vd_dir, "*_color.png")))
+        or sorted(glob.glob(os.path.join(c3vd_dir, "rgb", "*_color.png")))
+        or sorted(glob.glob(os.path.join(c3vd_dir, "*.png")))
+    )
+    return candidates
 from depth_backbones import make_backbone
-from dynamic_organ import DynamicOrganBuilder
 from dashboard_common import (
     depth_to_colormap, frustum_visibility, compute_organ_centerline,
     render_gps_frame, draw_hud,
@@ -93,20 +120,16 @@ def _align_trajectory_to_organ(cam_positions, centerline, max_corr=80.0):
 def run(args):
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ---- Load RGB+depth pairs and poses ----
-    pairs_with_gt = _find_pairs(args.c3vd_dir)
-    rgbs_alone = sorted(glob.glob(os.path.join(args.c3vd_dir, "*_color.png"))) \
-        or sorted(glob.glob(os.path.join(args.c3vd_dir, "rgb", "*_color.png"))) \
-        or sorted(glob.glob(os.path.join(args.c3vd_dir, "*.png")))
-    rgb_paths = [p[0] for p in pairs_with_gt] if pairs_with_gt else rgbs_alone
-    gt_depth_paths = ([p[1] for p in pairs_with_gt]
-                      if pairs_with_gt else [None] * len(rgb_paths))
+    # ---- Load RGB frames and poses ----
+    # Bronchoscopy video flow has no GT depth files alongside the
+    # frames; the calibration block below handles that fallback.
+    rgb_paths = _find_color_frames(args.c3vd_dir)
+    gt_depth_paths = [None] * len(rgb_paths)
 
     pose_path = os.path.join(args.c3vd_dir, "pose.txt")
     if not os.path.exists(pose_path):
         sys.exit(f"ERROR: missing {pose_path}")
-    poses = parse_c3vd_poses(pose_path)
-    poses = [_pose_to_organ_space(p) for p in poses]
+    poses = parse_pose_txt(pose_path)
 
     n = min(len(rgb_paths), len(poses))
     rgb_paths, gt_depth_paths, poses = (rgb_paths[:n], gt_depth_paths[:n],
@@ -162,39 +185,79 @@ def run(args):
                            repo_dir=args.endodac_repo,
                            weights_path=args.endodac_weights)
 
-    # ---- Calibration (relative variants only, needs GT) ----
+    # ---- Calibration (relative variants only) ----
+    # If GT depth is available we fit per-frame depth = a/pred + b against
+    # it. If not (e.g. arbitrary bronchoscopy video), we fall back to a
+    # *scale-only* calibration that anchors median predicted disparity to
+    # an assumed median scene depth (--assumed_median_depth_mm).
     a_avg = b_avg = None
     if not bb.is_metric:
         gt_idx = [i for i, p in enumerate(gt_depth_paths) if p]
-        if not gt_idx:
-            sys.exit("ERROR: relative backbone needs C3VD GT depth files for "
-                     "calibration.")
-        cal_idx = gt_idx[::max(1, len(gt_idx) // args.calibration_frames)] \
-            [:args.calibration_frames]
-        a_list, b_list = [], []
-        for i in tqdm(cal_idx, desc="Calibration"):
-            rgb = cv2.cvtColor(cv2.imread(rgb_paths[i]), cv2.COLOR_BGR2RGB)
-            pred = bb.predict(rgb)
-            gt_mm = _read_c3vd_depth_mm(gt_depth_paths[i], target_hw=(H, W))
-            a, b = fit_disparity_to_depth(pred, gt_mm)
-            if a is not None:
-                a_list.append(a)
-                b_list.append(b)
-        a_avg = float(np.median(a_list))
-        b_avg = float(np.median(b_list))
-        print(f"Global calib (median over {len(a_list)} frames): "
-              f"a={a_avg:.2f}, b={b_avg:.2f}")
+        if gt_idx:
+            cal_idx = gt_idx[::max(1, len(gt_idx) // args.calibration_frames)] \
+                [:args.calibration_frames]
+            a_list, b_list = [], []
+            for i in tqdm(cal_idx, desc="Calibration"):
+                rgb = cv2.cvtColor(cv2.imread(rgb_paths[i]), cv2.COLOR_BGR2RGB)
+                pred = bb.predict(rgb)
+                gt_mm = _read_c3vd_depth_mm(gt_depth_paths[i], target_hw=(H, W))
+                a, b = fit_disparity_to_depth(pred, gt_mm)
+                if a is not None:
+                    a_list.append(a)
+                    b_list.append(b)
+            a_avg = float(np.median(a_list))
+            b_avg = float(np.median(b_list))
+            print(f"Global calib (median over {len(a_list)} frames): "
+                  f"a={a_avg:.2f}, b={b_avg:.2f}")
+        else:
+            assumed = float(getattr(args, 'assumed_median_depth_mm', 20.0))
+            sample_idx = list(range(0, len(rgb_paths),
+                                    max(1, len(rgb_paths) // 10)))[:10]
+            preds = []
+            for i in tqdm(sample_idx, desc="Auto-scale (no GT)"):
+                rgb = cv2.cvtColor(cv2.imread(rgb_paths[i]), cv2.COLOR_BGR2RGB)
+                preds.append(float(np.median(bb.predict(rgb))))
+            med_pred = float(np.median(preds)) if preds else 1.0
+            a_avg = assumed * max(med_pred, 1e-6)
+            b_avg = 0.0
+            print(f"No GT depth available; auto-scale calibration "
+                  f"(median pred={med_pred:.3f}, assumed median depth="
+                  f"{assumed:.1f} mm) -> a={a_avg:.2f}, b=0.")
 
     # ---- TSDF (dynamic mode) ----
+    # When the tracker already produced a 3D map (e.g. Endo-2DTAM's
+    # 2D Gaussian map saved as a .ply), skip TSDF entirely and load
+    # that as the organ mesh instead.
     organ_builder = None
-    if args.mode == "dynamic":
-        organ_builder = DynamicOrganBuilder(
-            voxel_size=args.voxel_size,
-            depth_trunc=args.depth_trunc,
-            depth_min=0.5,
-        )
-        print(f"TSDF: voxel={args.voxel_size} mm, "
-              f"depth_trunc={args.depth_trunc} mm")
+    prebuilt = getattr(args, "prebuilt_gs_map", None)
+    if prebuilt and os.path.isfile(prebuilt) and args.mode == "dynamic":
+        print(f"Using pre-built tracker map (skipping TSDF): {prebuilt}")
+        try:
+            premesh = o3d.io.read_triangle_mesh(prebuilt)
+            premesh.compute_vertex_normals()
+            if len(premesh.vertices) > 0:
+                organ_pts = np.asarray(premesh.vertices, dtype=np.float64)
+                if gps_data is None:
+                    gps_data = {}
+                gps_data['organ_pts'] = organ_pts
+                gps_data['centerline'] = compute_organ_centerline(
+                    premesh, n_points=200)
+                gps_data['center'] = organ_pts.mean(axis=0)
+                gps_data['extent'] = (
+                    organ_pts.max(axis=0) - organ_pts.min(axis=0))
+                gps_data.setdefault('elev', 25)
+                gps_data.setdefault('azim', 45)
+                gps_data.setdefault('n_frames', n)
+        except Exception as e:
+            sys.exit(f"ERROR: failed to load Endo-2DTAM map "
+                     f"({prebuilt}): {e}")
+    elif args.mode == "dynamic":
+        sys.exit(
+            "ERROR: --mode dynamic requires a pre-built Gaussian map "
+            "(prebuilt_gs_map). run_video_dashboard.py wires this up "
+            "automatically via Endo-2DTAM; if you're calling "
+            "render_navigation_c3vd directly, use --mode reveal with "
+            "--organ_mesh instead.")
 
     # ---- GPS scene data ----
     if organ_mesh is not None:
@@ -301,20 +364,7 @@ def run(args):
         if args.depth_smooth_ksize >= 3:
             depth_mm = cv2.medianBlur(depth_mm, args.depth_smooth_ksize)
 
-        # ---- TSDF integrate (dynamic mode only) ----
-        if organ_builder is not None and np.any(depth_mm > 0):
-            w2c = np.linalg.inv(poses[idx]).astype(np.float64)
-            organ_builder.integrate(rgb, depth_mm, w2c, intrinsic)
-            if (idx % args.mesh_update_every == 0) or (idx == n - 1):
-                mesh = organ_builder.extract_mesh()
-                if mesh is not None:
-                    new_pts = np.asarray(mesh.vertices)
-                    gps_data['organ_pts'] = new_pts
-                    gps_data['sub_idx'] = None
-                    combined = np.vstack([new_pts, cam_positions])
-                    gps_data['center'] = combined.mean(axis=0)
-                    gps_data['extent'] = (combined.max(0) - combined.min(0)
-                                          + 10.0)
+        # (no online TSDF — the GS map is pre-built by Endo-2DTAM)
 
         # ---- coverage update ----
         if seen_any is not None:
@@ -349,6 +399,7 @@ def run(args):
             reveal_mode=(args.mode == "reveal"),
             cam_pos=cam_positions[idx],
             cam_forward=cam_forwards[idx],
+            cam_trajectory=cam_positions,
             width=gps_w, height=gps_h, dpi=80)
         gps_panel = cv2.cvtColor(gps_img, cv2.COLOR_RGB2BGR)
         if gps_panel.shape[:2] != (gps_h, gps_w):
@@ -361,11 +412,13 @@ def run(args):
         cov_pct = (float(seen_any.sum()) / max(len(gps_data['organ_pts']), 1)
                    * 100.0 if seen_any is not None else 0.0)
         n_mesh = len(gps_data['organ_pts']) if args.mode == "dynamic" else 0
-        n_fused = organ_builder.n_integrated if organ_builder else 0
+        n_fused = len(gps_data['organ_pts']) if args.mode == "dynamic" else 0
         draw_hud(gps_panel, gps_w=gps_w, elapsed_s=elapsed_s,
                  speed_mms=speed_mms, dist_mm=dist_mm,
                  mode=args.mode, cov_pct=cov_pct,
-                 n_mesh_verts=n_mesh, n_fused=n_fused)
+                 n_mesh_verts=n_mesh, n_fused=n_fused,
+                 atlas_disclaimer=bool(getattr(args, "atlas_disclaimer",
+                                               False)))
 
         # ---- composite ----
         canvas = np.zeros((vid_h, vid_w, 3), dtype=np.uint8)
@@ -382,12 +435,8 @@ def run(args):
     writer.release()
     print(f"Wrote: {video_path}")
 
-    if organ_builder is not None:
-        mesh = organ_builder.extract_mesh(min_vertices=0)
-        if mesh is not None and len(mesh.vertices) > 0:
-            mp = os.path.join(args.output_dir, "dynamic_organ_mesh.ply")
-            o3d.io.write_triangle_mesh(mp, mesh)
-            print(f"Final mesh: {mp} ({len(mesh.vertices):,} verts)")
+    # No final-mesh write here — Endo-2DTAM already wrote the
+    # 2D-Gaussian map (endo2dtam_gs_map.ply) into its own run dir.
 
 
 if __name__ == "__main__":
@@ -409,6 +458,11 @@ if __name__ == "__main__":
     p.add_argument("--skip_every", default=1, type=int)
     p.add_argument("--max_frames", default=None, type=int)
     p.add_argument("--calibration_frames", default=20, type=int)
+    p.add_argument("--assumed_median_depth_mm", default=20.0, type=float,
+                   help="Used to anchor depth scale when no GT depth is "
+                        "available (e.g. raw bronchoscopy video). 20 mm is "
+                        "a reasonable median for bronchoscopy; "
+                        "30-40 mm for colonoscopy.")
     p.add_argument("--depth_trunc", default=80.0, type=float)
     p.add_argument("--min_disparity_pct", default=10.0, type=float)
     p.add_argument("--depth_smooth_ksize", default=5, type=int)

@@ -1,1 +1,0 @@
-python scripts/pre_dam_dep.py --dataset_root data/endonerf/pulling_soft_tissues --rgb_paths images
