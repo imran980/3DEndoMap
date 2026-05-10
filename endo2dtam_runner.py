@@ -99,7 +99,9 @@ def _build_config(workdir: str, run_name: str, repo_dir: str,
                   yaml_path: str, seq_name: str,
                   image_hw, device: str = "cuda:0",
                   num_iters_tracking: int = 15,
-                  num_iters_mapping: int = 15) -> Dict[str, Any]:
+                  num_iters_mapping: int = 15,
+                  keyframe_every: int = 8,
+                  mapping_window_size: int = -1) -> Dict[str, Any]:
     """Mirror configs/c3vd/c3vd_base.py with our workdir + run_name +
     intrinsics. Tracking lr / mapping settings unchanged — they're tuned
     for endoscopy already by the upstream authors."""
@@ -111,10 +113,10 @@ def _build_config(workdir: str, run_name: str, repo_dir: str,
         primary_device=device,
         map_every=1,
         ba_every=100,
-        keyframe_every=8,
+        keyframe_every=keyframe_every,
         distance_keyframe_selection=True,
         distance_current_frame_prob=0.1,
-        mapping_window_size=-1,
+        mapping_window_size=mapping_window_size,
         report_global_progress_every=2000,
         scene_radius_depth_ratio=3,
         mean_sq_dist_method="projective",
@@ -286,6 +288,8 @@ def run_endo2dtam(frames: List[np.ndarray],
                   device: str = "cuda:0",
                   num_iters_tracking: int = 15,
                   num_iters_mapping: int = 15,
+                  keyframe_every: int = 8,
+                  mapping_window_size: int = -1,
                   cleanup: bool = True,
                   ) -> Tuple[List[np.ndarray], Optional[str], str]:
     """End-to-end: stage data, call rgbd_slam, return poses + gs_map_path.
@@ -327,6 +331,8 @@ def run_endo2dtam(frames: List[np.ndarray],
         image_hw=(H, W), device=device,
         num_iters_tracking=num_iters_tracking,
         num_iters_mapping=num_iters_mapping,
+        keyframe_every=keyframe_every,
+        mapping_window_size=mapping_window_size,
     )
 
     # rgbd_slam expects to be invoked with the cwd at the repo root so

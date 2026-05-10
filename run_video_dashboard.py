@@ -212,6 +212,19 @@ def run(args):
 
     # ---- 2. Load frames + depth -------------------------------------------
     frames, _ = _load_frames_rgb(frames_dir)
+    if args.input_scale and args.input_scale < 1.0:
+        s = float(args.input_scale)
+        H0, W0 = frames[0].shape[:2]
+        Hs = max(2, int(round(H0 * s)))
+        Ws = max(2, int(round(W0 * s)))
+        # Round to multiples of 14 — DINOv2/EndoDAC patch size; avoids
+        # an internal resize that wastes the savings we're trying to make.
+        Hs = max(14, (Hs // 14) * 14)
+        Ws = max(14, (Ws // 14) * 14)
+        print(f"--input_scale {s}: resizing {W0}x{H0} -> {Ws}x{Hs} "
+              f"before depth + SLAM")
+        frames = [cv2.resize(f, (Ws, Hs), interpolation=cv2.INTER_AREA)
+                  for f in frames]
     print(f"\nRunning depth backbone ({args.backbone}) on {len(frames)} frames...")
     depths_mm = _predict_depths_mm(frames, args)
 
@@ -226,6 +239,8 @@ def run(args):
         device=args.device,
         num_iters_tracking=args.endo2dtam_tracking_iters,
         num_iters_mapping=args.endo2dtam_mapping_iters,
+        keyframe_every=args.endo2dtam_keyframe_every,
+        mapping_window_size=args.endo2dtam_mapping_window,
         cleanup=not args.keep_endo2dtam_artifacts,
     )
     pose_path = os.path.join(frames_dir, "pose.txt")
@@ -310,6 +325,13 @@ if __name__ == "__main__":
                         "multi-GB per invocation; the GS-map .ply is "
                         "always preserved next to output_dir.")
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--input_scale", default=1.0, type=float,
+                   help="Resize frames by this factor before depth + SLAM "
+                        "(memory ~ scale^2). Try 0.5 if you OOM.")
+    p.add_argument("--endo2dtam_keyframe_every", default=8, type=int)
+    p.add_argument("--endo2dtam_mapping_window", default=-1, type=int,
+                   help="Endo-2DTAM mapping window size (-1 = unbounded). "
+                        "Set to e.g. 10 to cap memory growth on long runs.")
 
     # Depth backbone
     p.add_argument("--backbone", default="endodac",
