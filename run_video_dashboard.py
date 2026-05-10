@@ -234,13 +234,21 @@ def run(args):
 
     # ---- 4. Atlas (GPS canvas) when no patient-specific mesh given --------
     using_atlas = False
+    atlas_centerline = None
     if args.organ_mesh is None and args.atlas == "procedural":
-        from bronchus_atlas import write_atlas
+        from bronchus_atlas import write_atlas, airway_centerline_dfs
         atlas_path, branches = write_atlas(out_dir)
         args.organ_mesh = atlas_path
+        # The DFS centerline walks every branch in topology order — this
+        # is the spine the GPS panel needs for arclength-based snapping
+        # (compute_organ_centerline's PCA fallback collapses a branched
+        # tree to a single principal axis, which makes the lime dot
+        # meaningless on the atlas).
+        atlas_centerline = airway_centerline_dfs(branches)
         using_atlas = True
         print(f"[atlas] generated procedural bronchial tree "
-              f"({len(branches)} branches) -> {atlas_path}")
+              f"({len(branches)} branches, {len(atlas_centerline)} "
+              f"centerline pts) -> {atlas_path}")
 
     if args.mode in ("coverage", "reveal") and not args.organ_mesh:
         print(f"WARNING: --mode {args.mode} requires --organ_mesh; "
@@ -275,6 +283,7 @@ def run(args):
         trajectory_align_max_corr=80.0,
         atlas_disclaimer=using_atlas,
         prebuilt_gs_map=gs_map_path,
+        atlas_centerline=atlas_centerline,
     )
     print("\n=== Rendering dashboard ===")
     rnc.run(dash_args)

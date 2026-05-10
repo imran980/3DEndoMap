@@ -91,6 +91,49 @@ def _read_c3vd_depth_mm(path, target_hw=None):
     return raw.astype(np.float32) * (100.0 / 65535.0)
 
 
+def _snap_trajectory_to_centerline(cam_positions, centerline):
+    """Project each frame's cumulative path length onto a 1D centerline,
+    so the lime dot walks along the airway at the same arclength the
+    scope has traveled in 3D.
+
+    This is the right tool for the procedural-atlas case: the atlas is a
+    generic shape and we have no patient-specific registration, so the
+    only meaningful "where is the scope" signal is "how far down the
+    airway have we advanced." Rigid 6-DoF ICP onto a branched centerline
+    has no rotational lock-in for short, drifty trajectories and was
+    collapsing the lime dot to the atlas centroid.
+
+    Returns (snapped_positions, snapped_forwards) — both Nx3, in the
+    centerline's coordinate frame. Forwards are the local centerline
+    tangent so the GPS panel can draw a meaningful heading arrow.
+    """
+    cl = np.asarray(centerline, dtype=np.float64)
+    if cl.ndim != 2 or cl.shape[0] < 2 or cl.shape[1] != 3:
+        raise ValueError(
+            f"centerline must be (N>=2, 3); got {cl.shape}.")
+    cam = np.asarray(cam_positions, dtype=np.float64)
+    seg = np.linalg.norm(np.diff(cam, axis=0), axis=1)
+    cam_arclen = np.concatenate([[0.0], np.cumsum(seg)])
+
+    cl_seg = np.linalg.norm(np.diff(cl, axis=0), axis=1)
+    cl_arclen = np.concatenate([[0.0], np.cumsum(cl_seg)])
+    cl_total = float(cl_arclen[-1])
+
+    snapped_pos = np.zeros_like(cam, dtype=np.float64)
+    snapped_fwd = np.zeros_like(cam, dtype=np.float64)
+    for i in range(len(cam)):
+        s = float(min(cam_arclen[i], cl_total))
+        seg_idx = int(np.searchsorted(cl_arclen, s) - 1)
+        seg_idx = max(0, min(seg_idx, len(cl) - 2))
+        s0, s1 = cl_arclen[seg_idx], cl_arclen[seg_idx + 1]
+        t = (s - s0) / max(s1 - s0, 1e-9)
+        snapped_pos[i] = cl[seg_idx] * (1 - t) + cl[seg_idx + 1] * t
+        tangent = cl[seg_idx + 1] - cl[seg_idx]
+        n = float(np.linalg.norm(tangent))
+        snapped_fwd[i] = (tangent / n) if n > 1e-9 else np.array([0, 0, -1.0])
+    return snapped_pos, snapped_fwd
+
+
 def _align_trajectory_to_organ(cam_positions, centerline, max_corr=80.0):
     """Rigid (R,t) ICP fitting the camera trajectory onto the organ
     centerline, so the reveal/coverage frustum tests actually hit the
@@ -262,26 +305,54 @@ def run(args):
     # ---- GPS scene data ----
     if organ_mesh is not None:
         organ_pts = np.asarray(organ_mesh.vertices, dtype=np.float64)
-        centerline = compute_organ_centerline(organ_mesh, n_points=200)
+        atlas_centerline = getattr(args, "atlas_centerline", None)
+        use_arclength_snap = (
+            atlas_centerline is not None
+            and len(np.asarray(atlas_centerline)) >= 2)
 
-        # Snap the camera trajectory onto the organ centerline so the frustum
-        # tests in coverage/reveal modes actually hit the mesh. _pose_to_organ
-        # _space() handles the rotation between C3VD pose convention and the
-        # OBJ; this ICP fixes the residual translation (and refines rotation).
-        if not args.no_trajectory_align:
-            T_align, fit = _align_trajectory_to_organ(
-                cam_positions, centerline,
-                max_corr=args.trajectory_align_max_corr)
-            print(f"Trajectory->organ ICP: fitness={fit:.3f}")
-            R = T_align[:3, :3]
-            t = T_align[:3, 3]
-            cam_positions = (R @ cam_positions.T).T + t
-            cam_forwards = (R @ cam_forwards.T).T
-            norms = np.linalg.norm(cam_forwards, axis=1, keepdims=True)
-            cam_forwards = np.where(
-                norms > 1e-6, cam_forwards / np.maximum(norms, 1e-9),
-                np.array([0, 0, -1.0]))
-            poses = [T_align @ p for p in poses]
+        if use_arclength_snap:
+            # Atlas case: we have a real DFS-walk centerline through the
+            # bronchial tree. Skip the ICP — for a short, drifty SLAM
+            # trajectory it has no rotational signal and collapses the
+            # lime dot to the atlas centroid. Instead, snap each frame
+            # along the centerline by the cumulative path length the
+            # scope has traveled. The lime dot then walks the airway at
+            # the same speed as the camera moves in 3D.
+            centerline = np.asarray(atlas_centerline, dtype=np.float64)
+            cl_arclen_total = float(
+                np.linalg.norm(np.diff(centerline, axis=0), axis=1).sum())
+            cam_arclen_total = float(
+                np.linalg.norm(np.diff(cam_positions, axis=0), axis=1).sum())
+            print(f"Trajectory->atlas arclength snap: scope traveled "
+                  f"{cam_arclen_total:.1f} mm over {n} frames; atlas "
+                  f"centerline is {cl_arclen_total:.1f} mm.")
+            cam_positions, cam_forwards = _snap_trajectory_to_centerline(
+                cam_positions, centerline)
+            cam_positions = cam_positions.astype(np.float32)
+            cam_forwards = cam_forwards.astype(np.float32)
+            # cum_dist / seg_len computed earlier off raw cam_positions
+            # are the *real* scope path lengths (in mm now that
+            # endo2dtam_runner converts m->mm). Keep them — the HUD's
+            # speed/path readouts should reflect actual scope motion,
+            # not the snapped arclength.
+        else:
+            centerline = compute_organ_centerline(organ_mesh, n_points=200)
+            # Snap the camera trajectory onto the organ centerline so the
+            # frustum tests in coverage/reveal modes actually hit the mesh.
+            if not args.no_trajectory_align:
+                T_align, fit = _align_trajectory_to_organ(
+                    cam_positions, centerline,
+                    max_corr=args.trajectory_align_max_corr)
+                print(f"Trajectory->organ ICP: fitness={fit:.3f}")
+                R = T_align[:3, :3]
+                t = T_align[:3, 3]
+                cam_positions = (R @ cam_positions.T).T + t
+                cam_forwards = (R @ cam_forwards.T).T
+                norms = np.linalg.norm(cam_forwards, axis=1, keepdims=True)
+                cam_forwards = np.where(
+                    norms > 1e-6, cam_forwards / np.maximum(norms, 1e-9),
+                    np.array([0, 0, -1.0]))
+                poses = [T_align @ p for p in poses]
 
         gps_data = {
             'organ_pts': organ_pts,

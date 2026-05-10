@@ -250,6 +250,13 @@ def _read_outputs(workdir: str, run_name: str
             f"params.npz keys {keys}: couldn't find pose arrays. "
             "Update _read_outputs() to match.")
 
+    # Endo-2DTAM ran with png_depth_scale=1000, so its world frame is in
+    # METERS. The atlas (and every other organ-space consumer in this
+    # repo) is in MILLIMETERS. Convert here so downstream code never has
+    # to think about it. Rotations untouched; only translations scale.
+    for p in poses:
+        p[:3, 3] *= 1000.0
+
     # Save the Gaussian centers as a .ply for the dashboard's GPS panel.
     gs_ply: Optional[str] = None
     pts: Optional[np.ndarray] = None
@@ -261,9 +268,11 @@ def _read_outputs(workdir: str, run_name: str
         # Endo-2DTAM stores means3D as (3, N) sometimes; flip to (N, 3).
         if pts.shape[0] == 3 and pts.shape[1] != 3:
             pts = pts.T
+        # Same meters->mm scaling as the poses above.
+        pts = pts.astype(np.float64) * 1000.0
         gs_ply = os.path.join(run_dir, "endo2dtam_gs_map.ply")
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+        pcd.points = o3d.utility.Vector3dVector(pts)
         o3d.io.write_point_cloud(gs_ply, pcd)
 
     return poses, gs_ply
