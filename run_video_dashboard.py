@@ -43,6 +43,41 @@ import render_navigation_c3vd as rnc
 from endo2dtam_runner import run_endo2dtam
 
 
+def _optical_flow_advance_mm(frames, hfov_deg, median_depth_mm):
+    """Per-frame scope advance estimated from dense optical flow.
+
+    Mean pixel-flow magnitude * scene_depth / focal_length gives a
+    rough metric advance (mm). Used as a fallback when Endo-2DTAM
+    tracking collapses to identity. Caveat: pure rotation also
+    produces flow, so the estimate over-reads on rotation-only motion.
+    """
+    H, W = frames[0].shape[:2]
+    fx = W / (2.0 * np.tan(np.radians(hfov_deg) / 2.0))
+    advances = [0.0]
+    prev = cv2.cvtColor(frames[0], cv2.COLOR_RGB2GRAY)
+    for f in tqdm(frames[1:], desc="Optical flow"):
+        gray = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY)
+        flow = cv2.calcOpticalFlowFarneback(
+            prev, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+        advances.append(float(np.mean(mag)) * median_depth_mm / fx)
+        prev = gray
+    return np.asarray(advances, dtype=np.float64)
+
+
+def _synthesize_poses_from_advance(advance_mm):
+    """Build a list of c2w matrices: identity rotation, position
+    walking along -z by the cumulative scope advance. Magnitudes (not
+    directions) are what the centerline arclength snap consumes."""
+    cum = np.cumsum(advance_mm)
+    poses = []
+    for s in cum:
+        p = np.eye(4, dtype=np.float64)
+        p[2, 3] = float(s)
+        poses.append(p)
+    return poses
+
+
 def write_pose_txt(poses, path):
     """Save 4x4 c2w matrices, one per line (16 floats, comma-separated,
     transposed before flatten so render_navigation_c3vd.parse_pose_txt
@@ -243,9 +278,40 @@ def run(args):
         mapping_window_size=args.endo2dtam_mapping_window,
         cleanup=not args.keep_endo2dtam_artifacts,
     )
+
+    # Detect Endo-2DTAM tracking failure (all-identity poses) and fall
+    # back to an optical-flow scope-advance estimate. On real
+    # bronchoscopy + EndoDAC-predicted depth, their tracker's loss
+    # landscape is flat near identity and the "save-best-iter" logic
+    # commits the identity init every frame. The mapper still runs but
+    # the per-frame trajectory is unusable. Flow magnitude isn't a real
+    # 6-DoF pose (it conflates rotation with translation), but it gives
+    # the GPS dot a believable forward-advance signal that tracks
+    # whether the scope is moving.
+    cam_pos = np.array([p[:3, 3] for p in poses], dtype=np.float64)
+    slam_total_mm = float(
+        np.linalg.norm(np.diff(cam_pos, axis=0), axis=1).sum())
+    if args.motion_source == 'flow' or (
+            args.motion_source == 'auto' and slam_total_mm < 0.5):
+        if args.motion_source == 'auto':
+            print(f"WARNING: Endo-2DTAM tracker produced "
+                  f"{slam_total_mm:.3f} mm of total motion across "
+                  f"{len(poses)} frames -> tracking failed. Falling "
+                  f"back to optical-flow scope-advance estimate.")
+        else:
+            print("Using optical-flow scope-advance estimate "
+                  "(--motion_source flow).")
+        adv = _optical_flow_advance_mm(
+            frames, hfov_deg=args.hfov,
+            median_depth_mm=float(args.assumed_median_depth_mm))
+        poses = _synthesize_poses_from_advance(adv)
+        print(f"Flow-derived total advance: {adv.sum():.1f} mm over "
+              f"{len(adv)} frames "
+              f"(mean {adv.mean():.3f} mm/frame).")
+
     pose_path = os.path.join(frames_dir, "pose.txt")
     write_pose_txt(poses, pose_path)
-    print(f"Wrote {len(poses)} refined poses -> {pose_path}")
+    print(f"Wrote {len(poses)} poses -> {pose_path}")
 
     # ---- 4. Atlas (GPS canvas) when no patient-specific mesh given --------
     using_atlas = False
@@ -325,6 +391,14 @@ if __name__ == "__main__":
                         "multi-GB per invocation; the GS-map .ply is "
                         "always preserved next to output_dir.")
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--motion_source", default="auto",
+                   choices=["auto", "slam", "flow"],
+                   help="Where the GPS dot's motion comes from. 'slam' = "
+                        "use Endo-2DTAM poses (fails on real bronchoscopy "
+                        "with predicted depth). 'flow' = optical-flow "
+                        "scope-advance estimate. 'auto' (default) = slam, "
+                        "fall back to flow if tracking collapsed to "
+                        "identity (<0.5 mm total motion).")
     p.add_argument("--input_scale", default=1.0, type=float,
                    help="Resize frames by this factor before depth + SLAM "
                         "(memory ~ scale^2). Try 0.5 if you OOM.")
