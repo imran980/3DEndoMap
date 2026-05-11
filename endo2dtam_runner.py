@@ -120,7 +120,7 @@ def _build_config(workdir: str, run_name: str, repo_dir: str,
         report_global_progress_every=2000,
         scene_radius_depth_ratio=3,
         mean_sq_dist_method="projective",
-        report_iter_progress=False,
+        report_iter_progress=True,
         load_checkpoint=False,
         checkpoint_time_idx=0,
         save_checkpoints=False,
@@ -137,9 +137,16 @@ def _build_config(workdir: str, run_name: str, repo_dir: str,
             use_train_split=True,
         ),
         tracking=dict(
+            # use_sil_for_loss=False: SplaTAM gates the tracking loss by
+            # a rendered-silhouette mask (sil_thres of the alpha map). On
+            # short clips with sparse Gaussians and low-texture
+            # bronchoscopy interior, almost no pixels exceed the
+            # threshold -> loss collapses to zero -> cam_trans never
+            # updates -> forward_prop carries identity forward forever.
+            # Drop the gate and let depth + point2plane drive tracking.
             use_gt_poses=False, forward_prop=True,
             num_iters=num_iters_tracking,
-            use_sil_for_loss=True, sil_thres=0.99,
+            use_sil_for_loss=False, sil_thres=0.99,
             use_l1=True, ignore_outlier_depth_loss=False,
             loss_weights=dict(im=0.5, depth=1.0, point2plane=1.0),
             lrs=dict(means3D=0.0, rgb_colors=0.0, unnorm_rotations=0.0,
