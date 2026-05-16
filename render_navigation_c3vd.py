@@ -92,16 +92,14 @@ def _read_c3vd_depth_mm(path, target_hw=None):
 
 
 def _snap_trajectory_to_centerline(cam_positions, centerline):
-    """Project each frame's cumulative path length onto a 1D centerline,
-    so the lime dot walks along the airway at the same arclength the
-    scope has traveled in 3D.
+    """Project each frame's *signed* along-axis path length onto a 1D
+    centerline, so the lime dot walks along the airway by actual scope
+    motion — advance positive, withdrawal negative.
 
-    This is the right tool for the procedural-atlas case: the atlas is a
-    generic shape and we have no patient-specific registration, so the
-    only meaningful "where is the scope" signal is "how far down the
-    airway have we advanced." Rigid 6-DoF ICP onto a branched centerline
-    has no rotational lock-in for short, drifty trajectories and was
-    collapsing the lime dot to the atlas centroid.
+    Each per-frame displacement is projected onto the trajectory's
+    principal axis (sign chosen so net travel is positive). Compared to
+    the previous ||diff||-only cumulative, this makes the dot walk back
+    when the scope is withdrawn instead of monotonically advancing.
 
     Returns (snapped_positions, snapped_forwards) — both Nx3, in the
     centerline's coordinate frame. Forwards are the local centerline
@@ -112,8 +110,18 @@ def _snap_trajectory_to_centerline(cam_positions, centerline):
         raise ValueError(
             f"centerline must be (N>=2, 3); got {cl.shape}.")
     cam = np.asarray(cam_positions, dtype=np.float64)
-    seg = np.linalg.norm(np.diff(cam, axis=0), axis=1)
-    cam_arclen = np.concatenate([[0.0], np.cumsum(seg)])
+    diffs = np.diff(cam, axis=0)
+    if len(cam) >= 2 and np.any(np.linalg.norm(diffs, axis=1) > 1e-9):
+        centered = cam - cam.mean(axis=0)
+        _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+        principal = Vt[0]
+        net = cam[-1] - cam[0]
+        if float(np.dot(net, principal)) < 0.0:
+            principal = -principal
+        signed_step = diffs @ principal
+    else:
+        signed_step = np.zeros(max(len(cam) - 1, 0), dtype=np.float64)
+    cam_arclen = np.concatenate([[0.0], np.cumsum(signed_step)])
 
     cl_seg = np.linalg.norm(np.diff(cl, axis=0), axis=1)
     cl_arclen = np.concatenate([[0.0], np.cumsum(cl_seg)])
@@ -122,7 +130,9 @@ def _snap_trajectory_to_centerline(cam_positions, centerline):
     snapped_pos = np.zeros_like(cam, dtype=np.float64)
     snapped_fwd = np.zeros_like(cam, dtype=np.float64)
     for i in range(len(cam)):
-        s = float(min(cam_arclen[i], cl_total))
+        # Clip to [0, cl_total]: dot pins at carina or distal tip rather
+        # than extrapolating off the centerline.
+        s = float(np.clip(cam_arclen[i], 0.0, cl_total))
         seg_idx = int(np.searchsorted(cl_arclen, s) - 1)
         seg_idx = max(0, min(seg_idx, len(cl) - 2))
         s0, s1 = cl_arclen[seg_idx], cl_arclen[seg_idx + 1]
@@ -132,6 +142,28 @@ def _snap_trajectory_to_centerline(cam_positions, centerline):
         n = float(np.linalg.norm(tangent))
         snapped_fwd[i] = (tangent / n) if n > 1e-9 else np.array([0, 0, -1.0])
     return snapped_pos, snapped_fwd
+
+
+def _centerline_tangents_at(positions, centerline):
+    """For each point, return the unit tangent of the nearest centerline
+    segment. Used so the heading arrow / frustum direction track the
+    airway axis instead of whatever (often collapsed) rotation the SLAM
+    tracker produced.
+    """
+    cl = np.asarray(centerline, dtype=np.float64)
+    pos = np.asarray(positions, dtype=np.float64)
+    if len(cl) < 2:
+        return np.tile(np.array([0.0, 0.0, -1.0]), (len(pos), 1))
+    seg_mid = 0.5 * (cl[:-1] + cl[1:])
+    seg_vec = cl[1:] - cl[:-1]
+    seg_len = np.linalg.norm(seg_vec, axis=1, keepdims=True)
+    seg_dir = np.where(seg_len > 1e-9, seg_vec / np.maximum(seg_len, 1e-9),
+                       np.array([0.0, 0.0, -1.0]))
+    fwd = np.zeros_like(pos)
+    for i, p in enumerate(pos):
+        d2 = np.sum((seg_mid - p[None, :]) ** 2, axis=1)
+        fwd[i] = seg_dir[int(np.argmin(d2))]
+    return fwd
 
 
 def _align_trajectory_to_organ(cam_positions, centerline, max_corr=80.0):
@@ -347,12 +379,15 @@ def run(args):
                 R = T_align[:3, :3]
                 t = T_align[:3, 3]
                 cam_positions = (R @ cam_positions.T).T + t
-                cam_forwards = (R @ cam_forwards.T).T
-                norms = np.linalg.norm(cam_forwards, axis=1, keepdims=True)
-                cam_forwards = np.where(
-                    norms > 1e-6, cam_forwards / np.maximum(norms, 1e-9),
-                    np.array([0, 0, -1.0]))
                 poses = [T_align @ p for p in poses]
+            # Override SLAM forwards with the nearest centerline tangent.
+            # On real bronchoscopy + predicted depth the tracker's
+            # rotations are usually collapsed near identity, which makes
+            # the GPS heading arrow and frustum coverage point sideways.
+            # Snapping to the airway axis is the correct heading proxy
+            # given we've already snapped position-by-arclength.
+            cam_forwards = _centerline_tangents_at(
+                cam_positions, centerline).astype(np.float32)
 
         gps_data = {
             'organ_pts': organ_pts,
