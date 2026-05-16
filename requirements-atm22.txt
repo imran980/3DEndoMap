@@ -1,0 +1,7 @@
+nibabel
+kimimaro
+scikit-image
+trimesh
+networkx
+numpy
+tqdm
