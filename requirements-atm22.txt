@@ -5,3 +5,4 @@ trimesh
 networkx
 numpy
 tqdm
+h5py
