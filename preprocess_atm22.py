@@ -116,14 +116,20 @@ def _subject_id(path):
     return base
 
 
-def process_one(label_path, out_root, decimate_target):
+def process_one(label_path, out_root, decimate_target, delete_raw_after=False):
     sid = _subject_id(label_path)
     out_dir = os.path.join(out_root, sid)
     os.makedirs(out_dir, exist_ok=True)
     mesh_path = os.path.join(out_dir, 'airway_mesh.ply')
     cl_path = os.path.join(out_dir, 'centerline.npz')
     g_path = os.path.join(out_dir, 'bifurcation_graph.gml')
-    if all(os.path.exists(p) for p in (mesh_path, cl_path, g_path)):
+    affine_path = os.path.join(out_dir, 'affine.npy')
+    spacing_path = os.path.join(out_dir, 'voxel_spacing_mm.npy')
+    required = (mesh_path, cl_path, g_path, affine_path, spacing_path)
+    if all(os.path.exists(p) for p in required):
+        # Even on skip, honor delete-after if the source still exists.
+        if delete_raw_after and os.path.exists(label_path):
+            os.remove(label_path)
         return sid, 'skipped (already exists)'
 
     nii = nib.load(label_path)
@@ -131,7 +137,9 @@ def process_one(label_path, out_root, decimate_target):
     if not mask.any():
         return sid, 'empty label'
     affine = nii.affine.astype(np.float64)
-    voxel_sizes = np.abs(np.diag(affine)[:3])
+    # Voxel sizes from a possibly-rotated affine: take column norms of
+    # the 3x3 linear block, not just the diagonal.
+    voxel_sizes = np.linalg.norm(affine[:3, :3], axis=0).astype(np.float32)
     voxel_size_mm = float(voxel_sizes.mean())
 
     mask = _largest_component(mask)
@@ -173,6 +181,18 @@ def process_one(label_path, out_root, decimate_target):
     mesh = _mesh_from_mask(mask, affine, decimate_target=decimate_target)
     mesh.export(mesh_path)
 
+    np.save(affine_path, affine)
+    np.save(spacing_path, voxel_sizes)
+
+    # Only delete the source after every output is confirmed on disk.
+    # Any failure above raises before we get here, so the raw file is
+    # preserved on error.
+    if delete_raw_after and all(os.path.exists(p) for p in required):
+        try:
+            os.remove(label_path)
+        except OSError as e:
+            print(f"  (could not delete {label_path}: {e})")
+
     return sid, (f'ok verts={len(mesh.vertices)} faces={len(mesh.faces)} '
                  f'bifurcations={int(is_bif.sum())} '
                  f'endpoints={int((np.bincount(edges.ravel()) == 1).sum())}')
@@ -189,6 +209,11 @@ def main():
                     help='Target face count after decimation; 0 disables.')
     ap.add_argument('--limit', type=int, default=None,
                     help='Process only the first N subjects (for testing).')
+    ap.add_argument('--delete_raw_after', action='store_true',
+                    help='Delete each source NIfTI immediately after its '
+                         'outputs are written and verified. Lets you '
+                         'process the whole dataset without doubling disk '
+                         'usage. IRREVERSIBLE — confirm with --limit first.')
     args = ap.parse_args()
 
     paths = sorted(
@@ -203,17 +228,21 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     decim = args.decimate_target if args.decimate_target > 0 else 0
+    delete_raw = bool(args.delete_raw_after)
+    if delete_raw:
+        print('WARNING: --delete_raw_after is on. Source NIfTI files will '
+              'be deleted as each subject completes.')
     failures = []
     if args.workers <= 1:
         for p in tqdm(paths, desc='subjects'):
-            sid, status = process_one(p, args.output_dir, decim)
+            sid, status = process_one(p, args.output_dir, decim, delete_raw)
             tqdm.write(f'{sid}: {status}')
             if not status.startswith('ok') and not status.startswith('skipped'):
                 failures.append((sid, status))
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(process_one, p, args.output_dir, decim): p
-                    for p in paths}
+            futs = {ex.submit(process_one, p, args.output_dir, decim,
+                              delete_raw): p for p in paths}
             for f in tqdm(as_completed(futs), total=len(futs),
                           desc='subjects'):
                 sid, status = f.result()

@@ -39,13 +39,16 @@ def _load_subject(subject_dir):
     G = nx.read_gml(g_path, destringizer=None) if os.path.exists(g_path) \
         else None
 
-    # NIfTI affine + voxel spacing aren't currently saved per subject;
-    # recover voxel spacing from the centerline node spacing as a
-    # fallback, and store identity affine. This is acceptable because
-    # everything is already in mm; affine/spacing are kept only for
-    # provenance/debug, not used by downstream SSM steps.
-    affine = np.eye(4, dtype=np.float64)
-    spacing = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    affine_path = os.path.join(subject_dir, "affine.npy")
+    spacing_path = os.path.join(subject_dir, "voxel_spacing_mm.npy")
+    if os.path.exists(affine_path):
+        affine = np.load(affine_path).astype(np.float64)
+    else:
+        affine = np.eye(4, dtype=np.float64)
+    if os.path.exists(spacing_path):
+        spacing = np.load(spacing_path).astype(np.float32)
+    else:
+        spacing = np.array([1.0, 1.0, 1.0], dtype=np.float32)
 
     return {
         "surface_verts": np.asarray(mesh.vertices, dtype=np.float32),
