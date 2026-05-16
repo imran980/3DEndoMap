@@ -3,7 +3,6 @@ matplotlib
 opencv-python
 tqdm
 open3d
-imageio[ffmpeg]
 torch
 torchvision
 transformers>=4.40

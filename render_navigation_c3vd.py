@@ -15,8 +15,9 @@ Three GPS modes:
   --mode coverage   pre-op organ + red→green coverage heatmap (default if
                     --organ_mesh is given)
   --mode reveal     pre-op organ painted in by camera frustum
-  --mode dynamic    organ mesh built live via TSDF fusion (no pre-op mesh
-                    needed; EndoDAC depth in mm goes straight into TSDF)
+  --mode dynamic    use a pre-built tracker map (e.g. Endo-2DTAM's 2D-
+                    Gaussian .ply) as the GPS canvas (no pre-op mesh
+                    needed). Wired up automatically by run_video_dashboard.
 
 Usage:
   python render_navigation_c3vd.py \
@@ -169,10 +170,9 @@ def _centerline_tangents_at(positions, centerline):
 def _align_trajectory_to_organ(cam_positions, centerline, max_corr=80.0):
     """Rigid (R,t) ICP fitting the camera trajectory onto the organ
     centerline, so the reveal/coverage frustum tests actually hit the
-    pre-op mesh. _pose_to_organ_space() only fixes the rotation between
-    C3VD's pose convention and the OBJ; this fixes the residual translation
-    (and refines rotation) by aligning the trajectory curve with the
-    centerline curve.
+    pre-op mesh. Initialized from centroid translation only — there is
+    no rotational prior, so on short, drifty trajectories the result is
+    only as good as the initial alignment.
 
     Returns (T_4x4, fitness).
     """
@@ -240,10 +240,13 @@ def run(args):
     elif args.mode in ("coverage", "reveal"):
         sys.exit(f"ERROR: --mode {args.mode} requires --organ_mesh.")
 
-    # ---- Camera trajectory (already in organ space) ----
+    # ---- Camera trajectory ----
+    # Poses come from whatever produced pose.txt (Endo-2DTAM or the
+    # optical-flow fallback) — no axis remap is applied here. Alignment
+    # to the organ mesh happens later via arclength snap (atlas) or ICP
+    # (patient mesh).
     cam_positions = np.array([p[:3, 3] for p in poses], dtype=np.float32)
-    # forward = c2w[:3, 2] in OpenCV/Open3D convention; same here since
-    # _pose_to_organ_space is a rigid axis remap.
+    # forward = c2w[:3, 2] in OpenCV/Open3D convention.
     cam_forwards = np.array([p[:3, 2] for p in poses], dtype=np.float32)
     norms = np.linalg.norm(cam_forwards, axis=1, keepdims=True)
     cam_forwards = np.where(norms > 1e-6, cam_forwards / np.maximum(norms, 1e-9),
@@ -572,9 +575,6 @@ if __name__ == "__main__":
     p.add_argument("--depth_trunc", default=80.0, type=float)
     p.add_argument("--min_disparity_pct", default=10.0, type=float)
     p.add_argument("--depth_smooth_ksize", default=5, type=int)
-    p.add_argument("--voxel_size", default=0.5, type=float,
-                   help="TSDF voxel size mm (dynamic mode)")
-    p.add_argument("--mesh_update_every", default=15, type=int)
     p.add_argument("--no_trajectory_align", action="store_true",
                    help="Skip the trajectory->centerline ICP (default: on). "
                         "Disable only if you've already aligned poses.")

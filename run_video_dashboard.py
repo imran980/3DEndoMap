@@ -358,8 +358,6 @@ def run(args):
         depth_trunc=args.depth_trunc,
         min_disparity_pct=10.0,
         depth_smooth_ksize=5,
-        voxel_size=0.5,
-        mesh_update_every=15,
         no_trajectory_align=(args.organ_mesh is None),
         trajectory_align_max_corr=80.0,
         atlas_disclaimer=using_atlas,
